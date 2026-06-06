@@ -5,6 +5,7 @@ from xfuser.model_executor.models.transformers.transformer_z_image import xFuser
 from xfuser.model_executor.models.runner_models.base_model import (
     xFuserModel,
     register_model,
+    runner_rng_device,
     DefaultInputValues,
     DiffusionOutput,
     ModelCapabilities,
@@ -96,7 +97,7 @@ class xFuserZImageModel(xFuserModel):
             prompt=prompt,
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device=runner_rng_device()).manual_seed(input_args["seed"]),
         )
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
@@ -154,6 +155,6 @@ class xFuserZImageTurboModel(xFuserModel):
             prompt=prompt,
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device=runner_rng_device()).manual_seed(input_args["seed"]),
         )
         return DiffusionOutput(images=output.images, pipe_args=input_args)

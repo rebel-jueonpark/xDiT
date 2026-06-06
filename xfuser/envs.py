@@ -9,6 +9,11 @@ try:
 except ModuleNotFoundError:
     pass
 
+try:
+    import torch_rbln
+except ModuleNotFoundError:
+    pass
+
 from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
@@ -80,6 +85,15 @@ def _is_npu():
         return False
 
 
+def _is_rbln():
+    try:
+        if hasattr(torch, "rbln") and torch.rbln.is_available():
+            return True
+    except ModuleNotFoundError:
+        return False
+    return False
+
+
 def get_device(local_rank: int) -> torch.device:
     if _is_cuda() or _is_hip():
         return torch.device("cuda", local_rank)
@@ -89,6 +103,8 @@ def get_device(local_rank: int) -> torch.device:
         return torch.device("mps")
     elif _is_npu():
         return torch.device("npu", local_rank)
+    elif _is_rbln():
+        return torch.device("rbln", local_rank)
     else:
         return torch.device("cpu")
 
@@ -102,6 +118,8 @@ def get_device_name() -> str:
         return "mps"
     elif _is_npu():
         return "npu"
+    elif _is_rbln():
+        return "rbln"
     else:
         return "cpu"
 
@@ -119,6 +137,8 @@ def get_device_version():
         return None
     elif _is_npu():
         return None
+    elif _is_rbln():
+        return None
     else:
         raise NotImplementedError(
             "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
@@ -134,6 +154,8 @@ def get_torch_distributed_backend() -> str:
         return "gloo"
     elif _is_npu():
         return "hccl"
+    elif _is_rbln():
+        return "rbln-ccl"
     else:
         raise NotImplementedError(
             "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
@@ -150,6 +172,8 @@ def get_platform() -> str:
         return "mps"
     elif _is_npu():
         return "npu"
+    elif _is_rbln():
+        return "rbln"
     else:
         return "cpu"
 
@@ -339,7 +363,7 @@ class PackagesEnvChecker:
 
 
     def check_long_ctx_attn(self):
-        if not (torch.cuda.is_available() or _is_npu()):
+        if not (torch.cuda.is_available() or _is_npu() or _is_rbln()):
             return False
         try:
             from yunchang import (

@@ -1,3 +1,12 @@
+# RBLN backend: install collective polyfills before xfuser internals import process groups.
+try:
+    from xfuser.envs import _is_rbln  # noqa: E402
+    if _is_rbln():
+        from xfuser.core.rbln_collectives import install_rbln_collective_polyfills  # noqa: E402
+        install_rbln_collective_polyfills()
+except Exception:
+    pass
+
 from xfuser.model_executor.pipelines import (
     xFuserPixArtAlphaPipeline,
     xFuserPixArtSigmaPipeline,

@@ -7,7 +7,7 @@ from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 import xfuser.envs as envs
 
-if torch.cuda.is_available() or envs._is_npu():
+if torch.cuda.is_available() or envs._is_npu() or envs._is_rbln():
     from yunchang.ring.utils import RingComm, update_out_and_lse
     from yunchang.ring.ring_flash_attn import RingFlashAttnFunc
     from yunchang.kernels import select_flash_attn_impl, AttnType

@@ -4,6 +4,7 @@ from diffusers import QwenImageEditPipeline, QwenImagePipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from xfuser.model_executor.models.runner_models.base_model import (
     register_model,
+    runner_rng_device,
     xFuserModel,
     ModelCapabilities,
     DefaultInputValues,
@@ -79,7 +80,7 @@ class xFuserQwenImageEditModel(xFuserModel):
             "negative_prompt": input_args["negative_prompt"],
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
-            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            "generator": torch.Generator(device=runner_rng_device()).manual_seed(input_args["seed"]),
         }
         if "height" in input_args: kwargs["height"] = input_args["height"]
         if "width" in input_args: kwargs["width"] = input_args["width"]
@@ -156,7 +157,7 @@ class xFuserQwenImageModel(xFuserModel):
             "negative_prompt": input_args["negative_prompt"],
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
-            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            "generator": torch.Generator(device=runner_rng_device()).manual_seed(input_args["seed"]),
         }
 
         output = self.pipe(**kwargs)

@@ -7,7 +7,7 @@ import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _templated_ring_attention
 import xfuser.envs as envs
 
-if torch.cuda.is_available() or envs._is_npu():
+if torch.cuda.is_available() or envs._is_npu() or envs._is_rbln():
     from yunchang.globals import PROCESS_GROUP
 else:
     PROCESS_GROUP = None
@@ -68,6 +68,13 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _sdpa_all_to_all_single(x):
+    if envs._is_rbln():
+        # rbln-ccl doesn't expose alltoall_base — emulate via allgather + slice.
+        from xfuser.core.rbln_collectives import _functional_all_to_all_single
+        x_shape = x.shape
+        x_flat = x.flatten().contiguous()
+        x_out = _functional_all_to_all_single(x_flat, group=PROCESS_GROUP.ULYSSES_PG)
+        return x_out.reshape(x_shape)
     x_shape = x.shape
     x = x.flatten()
     x = ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=PROCESS_GROUP.ULYSSES_PG)

@@ -1,7 +1,7 @@
 import torch
 from diffusers import FluxPipeline, FluxKontextPipeline, Flux2Pipeline, Flux2KleinPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from xfuser.envs import PACKAGES_CHECKER
+from xfuser.envs import PACKAGES_CHECKER, get_device_name
 from xfuser.model_executor.models.transformers.transformer_flux import xFuserFlux1Transformer2DWrapper
 from xfuser.model_executor.models.transformers.transformer_flux2 import xFuserFlux2Transformer2DWrapper
 from xfuser.model_executor.models.runner_models.base_model import (
@@ -11,6 +11,8 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
     ModelSettings,
+    match_scheduler_dtype_to_model as _match_scheduler_dtype_to_model,
+    maybe_move_vae_to_cpu as _maybe_move_vae_to_cpu,
 )
 from xfuser.core.utils.runner_utils import (
     log,
@@ -128,7 +130,7 @@ class xFuserFluxModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device="cpu").manual_seed(input_args["seed"]),
         )
         images = output.images if output else [] # For legacy pipelines
         return DiffusionOutput(images=images, pipe_args=input_args)
@@ -205,7 +207,7 @@ class xFuserFluxKontextModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device="cpu").manual_seed(input_args["seed"]),
         )
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
@@ -272,6 +274,8 @@ class xFuserFlux2Model(xFuserModel):
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
             _setup_parallel_vae(self.pipe.vae)
+        _match_scheduler_dtype_to_model(self.pipe, torch.bfloat16)
+        _maybe_move_vae_to_cpu(self.pipe)
 
 
     def _load_model(self) -> DiffusionPipeline:
@@ -307,7 +311,7 @@ class xFuserFlux2Model(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device="cpu").manual_seed(input_args["seed"]),
         )
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 
@@ -351,6 +355,8 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         super()._post_load_and_state_initialization(input_args)
         if self.config.use_parallel_vae:
             _setup_parallel_vae(self.pipe.vae)
+        _match_scheduler_dtype_to_model(self.pipe, torch.bfloat16)
+        _maybe_move_vae_to_cpu(self.pipe)
 
     def _load_model(self) -> DiffusionPipeline:
         transformer = xFuserFlux2Transformer2DWrapper.from_pretrained(
@@ -373,7 +379,7 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             image=input_args["images"],
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device="cpu").manual_seed(input_args["seed"]),
         )
         return DiffusionOutput(images=output.images, pipe_args=input_args)
 

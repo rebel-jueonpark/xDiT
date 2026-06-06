@@ -27,6 +27,11 @@ try:
 except ModuleNotFoundError:
     pass
 
+try:
+    from torch.rbln import set_device, device_count
+except (ModuleNotFoundError, AttributeError):
+    pass
+
 from .utils import RankGenerator
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()

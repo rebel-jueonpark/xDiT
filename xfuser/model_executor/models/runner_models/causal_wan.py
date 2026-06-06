@@ -10,6 +10,7 @@ from xfuser.model_executor.models.runner_models.base_model import (
     ModelSettings,
     xFuserModel,
     register_model,
+    runner_rng_device,
     ModelCapabilities,
     DefaultInputValues,
     DiffusionOutput,
@@ -131,7 +132,7 @@ class xFuserCausalWanModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             num_frames=input_args["num_frames"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=torch.Generator(device=runner_rng_device()).manual_seed(input_args["seed"]),
             num_frames_per_block=self._NUM_FRAMES_PER_BLOCK, # Processes X frames at a time
             sliding_window_num_frames=self._SLIDING_WINDOW_NUM_FRAMES, # Sliding window size
             context_noise=self._CONTEXT_NOISE, # Noise to add to the context as a regularization

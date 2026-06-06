@@ -18,6 +18,7 @@ from xfuser.envs import (
     get_platform,
     _is_hip,
     _is_cuda,
+    _is_rbln,
 )
 from xfuser.core.distributed.parallel_state import get_fs_group
 from xfuser.core.utils.runner_utils import (
@@ -48,6 +49,96 @@ from xfuser.core.distributed.attention_schedule import AttentionSchedule, create
 
 
 packages_info = PACKAGES_CHECKER.get_packages_info()
+
+
+# --------------------------------------------------------------------------- #
+# RBLN (Rebellions ATOM NPU) compatibility helpers, shared by all runner models
+# --------------------------------------------------------------------------- #
+def runner_rng_device() -> str:
+    """Device for pipeline RNG generators.
+
+    CUDA keeps its own RNG (output parity for existing GPU users); every other
+    backend (rbln / npu / cpu) uses CPU. torch-rbln exposes no CUDA generator,
+    and diffusers' ``randn_tensor`` transparently moves CPU-generated noise to
+    the pipeline's execution device, so a CPU generator is correct everywhere.
+    """
+    return "cuda" if _is_cuda() else "cpu"
+
+
+def match_scheduler_dtype_to_model(pipe, dtype) -> None:
+    """RBLN strictly forbids implicit fp32 -> bf16 casts inside in-place ops.
+
+    Diffusers' FlowMatch / DDIM-style schedulers keep sigmas/timesteps in fp32
+    and write the fp32 result of ``sigma * model_output`` into a bf16 ``out``
+    tensor. Cast the buffers up-front *and* wrap ``set_timesteps`` so the cast
+    survives re-initialization inside ``pipe(...)``. Idempotent.
+    """
+    scheduler = getattr(pipe, "scheduler", None)
+    if scheduler is None:
+        return
+    _attrs = ("sigmas", "timesteps", "betas", "alphas", "alphas_cumprod")
+
+    def _recast() -> None:
+        for attr in _attrs:
+            buf = getattr(scheduler, attr, None)
+            if isinstance(buf, torch.Tensor) and buf.is_floating_point():
+                setattr(scheduler, attr, buf.to(dtype))
+
+    _recast()
+    if getattr(scheduler, "_xfuser_set_timesteps_wrapped", False):
+        return
+    original_set_timesteps = scheduler.set_timesteps
+
+    @functools.wraps(original_set_timesteps)
+    def patched_set_timesteps(*a, **kw):
+        result = original_set_timesteps(*a, **kw)
+        _recast()
+        return result
+
+    scheduler.set_timesteps = patched_set_timesteps
+    scheduler._xfuser_set_timesteps_wrapped = True
+
+
+def maybe_move_vae_to_cpu(pipe) -> None:
+    """torch-rbln eager mode does not implement ``convolution_overrideable`` on
+    the privateuse1 device, which the VAE encoder/decoder need. Keep the VAE on
+    CPU (it runs once per image, not per step) and round-trip its activations.
+    No-op off RBLN. Idempotent.
+    """
+    if not _is_rbln():
+        return
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        return
+    vae.to("cpu")
+    if not getattr(vae, "_xfuser_decode_wrapped", False):
+        original_decode = vae.decode
+
+        @functools.wraps(original_decode)
+        def patched_decode(z, *a, **kw):
+            return original_decode(z.to("cpu").to(vae.dtype), *a, **kw)
+
+        vae.decode = patched_decode
+        vae._xfuser_decode_wrapped = True
+    if not getattr(vae, "_xfuser_encode_wrapped", False):
+        original_encode = vae.encode
+
+        @functools.wraps(original_encode)
+        def patched_encode(x, *a, **kw):
+            return original_encode(x.to("cpu").to(vae.dtype), *a, **kw)
+
+        vae.encode = patched_encode
+        vae._xfuser_encode_wrapped = True
+
+
+def apply_rbln_pipe_compat(pipe) -> None:
+    """Apply the RBLN scheduler-dtype + VAE-on-CPU fixes to a loaded pipeline.
+    Centralized so every runner model gets them on RBLN. No-op off RBLN."""
+    if not _is_rbln():
+        return
+    match_scheduler_dtype_to_model(pipe, torch.bfloat16)
+    maybe_move_vae_to_cpu(pipe)
+
 
 MODEL_REGISTRY = {}
 
@@ -242,6 +333,11 @@ class xFuserModel(abc.ABC):
         self._post_load_and_state_initialization(input_args)
         self._enable_options()
 
+        # RBLN: ensure scheduler buffers are bf16 and the VAE runs on CPU for
+        # every model (the FLUX.2 classes also do this in their own hook; these
+        # helpers are idempotent). No-op on CUDA/other backends.
+        apply_rbln_pipe_compat(self.pipe)
+
         if self.config.use_torch_compile:
             log("Torch.compile enabled. Warming up torch compiler ...")
             compile_input_args = copy.deepcopy(input_args)
@@ -385,9 +481,10 @@ class xFuserModel(abc.ABC):
                 warmup_args["prompt"] = warmup_args["prompt"][: self.config.batch_size]
             self._run_warmup_calls(warmup_args)
 
-        inference_start = torch.cuda.Event(enable_timing=True)
-        inference_end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        from xfuser.core import device_utils
+        inference_start = device_utils.event(enable_timing=True)
+        inference_end = device_utils.event(enable_timing=True)
+        device_utils.synchronize()
 
         inference_start.record()
         for iteration in range(self.config.num_iterations):
@@ -402,7 +499,7 @@ class xFuserModel(abc.ABC):
                 log(f"Iteration {iteration + 1} completed in {timing:.2f}s")
 
         inference_end.record()
-        torch.cuda.synchronize()
+        device_utils.synchronize()
 
         output = self._gather_dp_outputs(output)
 
@@ -538,15 +635,16 @@ class xFuserModel(abc.ABC):
     def _run_timed_pipe(self, input_args: dict) -> Tuple[DiffusionOutput, float]:
         """ Run a a full pipeline with timing information """
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        from xfuser.core import device_utils
+        start = device_utils.event(enable_timing=True)
+        end = device_utils.event(enable_timing=True)
+        device_utils.synchronize()
 
         start.record()
         out = self._run_pipe(input_args)
         end.record()
 
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         elapsed_time = start.elapsed_time(end) / 1000  # Convert to seconds
         return out, elapsed_time
 
@@ -566,6 +664,9 @@ class xFuserModel(abc.ABC):
         """ Hook for any post model-load and state initialization """
 
         local_rank = get_world_group().local_rank
+        from xfuser.envs import get_device_name
+        _dev_name = get_device_name()
+        _dev_str = f"{_dev_name}:{local_rank}" if _dev_name != "cpu" else "cpu"
         # FSDP path handles device placement and quantization (per-block for FSDP2).
         if self.config.fully_shard_degree > 1:
             self._shard_model_with_fsdp()
@@ -579,10 +680,10 @@ class xFuserModel(abc.ABC):
                 for module_name in self.settings.fp8_gemm_module_list:
                     log(f"Quantizing {module_name} to FP8 block-scale (AITER)...")
                     quantize_linear_layers_to_fp8_blockscale(
-                        rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}"
+                        rgetattr(self.pipe, module_name), device=_dev_str
                     )
             if not offload_requested:
-                self.pipe = self.pipe.to(f"cuda:{local_rank}")
+                self.pipe = self.pipe.to(_dev_str)
             if self.config.use_fp4_gemms:
                 if _is_cuda():
                     self._setup_nvfp4_gemms(local_rank=local_rank)
@@ -591,7 +692,7 @@ class xFuserModel(abc.ABC):
             if self.config.use_fp8_gemms and not _use_aiter_fp8_rdna4():
                 for module_name in self.settings.fp8_gemm_module_list:
                     log(f"Quantizing {module_name} to FP8 (torchao)...")
-                    quantize_linear_layers_to_fp8(rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}")
+                    quantize_linear_layers_to_fp8(rgetattr(self.pipe, module_name), device=_dev_str)
 
         if self.config.use_hybrid_attn_schedule:
             self._setup_hybrid_attn_schedule(input_args)
@@ -616,8 +717,9 @@ class xFuserModel(abc.ABC):
         device_group = get_fs_group().device_group
         for component_name, component in self.pipe.components.items():
             if component_name in self.settings.fsdp_strategy:
+                from xfuser.core import device_utils as _dev_utils
                 log(f"Sharding {component_name} with FSDP... "
-                    f"(VRAM before: {torch.cuda.memory_allocated(local_rank)/1e9:.2f}GB)")
+                    f"(VRAM before: {_dev_utils.memory_allocated(local_rank)/1e9:.2f}GB)")
                 strategy = self.settings.fsdp_strategy[component_name]
                 wrap_attrs = strategy.get("wrap_attrs", [])
                 dtype = strategy.get("dtype", None)
@@ -635,9 +737,9 @@ class xFuserModel(abc.ABC):
                     sync_module_states=False,
                 )
                 setattr(self.pipe, component_name, fsdp_object)
-                torch.cuda.empty_cache()
+                _dev_utils.empty_cache()
                 log(f"Sharded {component_name}. "
-                    f"(VRAM after: {torch.cuda.memory_allocated(local_rank)/1e9:.2f}GB)")
+                    f"(VRAM after: {_dev_utils.memory_allocated(local_rank)/1e9:.2f}GB)")
             else:
                 log(f"Skipping FSDP wrapping for {component_name}...")
                 if hasattr(component, "to"):
@@ -902,7 +1004,17 @@ class xFuserModel(abc.ABC):
 
         gather_list = [None] * world_group.world_size if world_group.rank == last_rank else None
 
-        torch.distributed.gather_object(send_obj, gather_list, dst=last_rank)
+        # rbln-ccl 0.2.x does not implement targeted `gather`; use all_gather_object
+        # (which routes through allgather) and have the last rank assemble the
+        # result. Memory cost: every rank momentarily holds the full list.
+        from xfuser.envs import _is_rbln
+        if _is_rbln():
+            full_list = [None] * world_group.world_size
+            torch.distributed.all_gather_object(full_list, send_obj)
+            if world_group.rank == last_rank:
+                gather_list = full_list
+        else:
+            torch.distributed.gather_object(send_obj, gather_list, dst=last_rank)
 
         if world_group.rank == last_rank:
             real_outputs = [o for o in gather_list if o is not None]
