@@ -70,6 +70,7 @@ class xFuserArgs:
     use_parallel_vae: bool = False
     # use_profiler: bool = False
     use_torch_compile: bool = False
+    torch_compile_backend: str = "auto"  # auto -> rbln on ATOM NPU, else inductor
     use_onediff: bool = False
     # Parallel arguments
     # data parallel
@@ -200,6 +201,14 @@ class xFuserArgs:
             "--use_torch_compile",
             action="store_true",
             help="Enable torch.compile to accelerate inference in a single card",
+        )
+        runtime_group.add_argument(
+            "--torch_compile_backend",
+            type=str,
+            default="auto",
+            choices=["auto", "inductor", "rbln"],
+            help="torch.compile backend. 'auto' selects 'rbln' (rebel-compiler) on ATOM NPU "
+                 "(supports conv + lowers collectives onto rbln-ccl), 'inductor' otherwise.",
         )
         runtime_group.add_argument(
             "--use_onediff",
@@ -448,6 +457,14 @@ class xFuserArgs:
             "--use_torch_compile",
             action="store_true",
             help="Enable torch.compile to accelerate inference in a single card",
+        )
+        parser.add_argument(
+            "--torch_compile_backend",
+            type=str,
+            default="auto",
+            choices=["auto", "inductor", "rbln"],
+            help="torch.compile backend. 'auto' selects 'rbln' (rebel-compiler) on ATOM NPU "
+                 "(supports conv + lowers collectives onto rbln-ccl), 'inductor' otherwise.",
         )
         parser.add_argument(
             "--attention_backend",

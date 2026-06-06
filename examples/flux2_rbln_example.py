@@ -15,6 +15,7 @@ import sys
 
 # RBLN distributed bootstrap env (must be set before torch_rbln C++ libs load).
 os.environ.setdefault("RCCL_FORCE_EXPORT_MEM", "1")
+os.environ.setdefault("RCCL_PORT_GEN", "1")  # multi-NPU rbln-ccl port generation
 os.environ.setdefault("RBLN_ROOT_IP", "127.0.0.1")
 os.environ.setdefault("RBLN_LOCAL_IP", "127.0.0.1")
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

@@ -1,64 +1,76 @@
-# Running xDiT on Rebellions ATOM™ NPU
+# Running xDiT on Rebellions ATOM™ NPU — `torch.compile` + rebel-compiler
 
-This guide explains, step by step, how to run xDiT diffusion-transformer inference
-on **Rebellions ATOM NPUs** using the `torch-rbln` backend.
+This branch (`adopt_atom_npu_compile`) runs xDiT diffusion transformers on
+**Rebellions ATOM NPUs** with **pure PyTorch + rebel-compiler via
+`torch.compile(backend="rbln")`**, and targets **multiple NPUs** via tensor
+parallelism.
 
-> **Status:** ATOM support runs **single-NPU** today and covers the
-> linear-patchify text→image DiTs (Flux, Z-Image, Qwen-Image) plus CogVideoX.
-> See the [Supported models](#5-supported-models-on-atom) matrix for exactly what
-> works, what is partial, and what is not yet supported — and
-> [Limitations](#7-limitations) for multi-NPU status.
+> **Why this branch is different.** The sibling `adopt_atom_npu` branch runs the
+> transformer in **eager** mode on the `torch-rbln` backend — which is single-NPU
+> and cannot run convolution (`convolution_overrideable not implemented`). This
+> branch instead **compiles** the transformer with the **rebel-compiler**
+> torch.compile backend, which **supports conv2d/conv3d** and can **lower in-graph
+> collectives (`all_reduce`/`all_gather`) onto `rbln-ccl`** for multi-NPU tensor
+> parallelism — the same technique `vllm-rbln` uses for LLMs.
+
+> **Status — work in progress (Stage 1a).** The compile backend is wired into xDiT
+> and the foundational ops are verified compiling on one NPU (conv2d/conv3d and
+> bf16 SDPA). Full end-to-end model bring-up and multi-NPU TP are still in
+> progress — see [§6 Status & roadmap](#6-status--roadmap) for exactly what works
+> and what's pending.
 
 ---
 
 ## 1. Prerequisites
 
 ### Hardware
-One or more Rebellions ATOM NPUs. Verify they are visible:
+One or more Rebellions ATOM NPUs:
 
 ```bash
-rbln-stat            # lists NPUs, memory (15.7 GiB each), utilization
-# rbln-stat -j       # JSON output
+rbln-stat            # lists NPUs (15.7 GiB each), utilization
 ```
 
-### Software stack (verified working set)
-| Package        | Verified version  | Notes |
-| ---            | ---               | ---   |
-| Python         | 3.12              | |
-| `torch`        | `2.10.0+cpu`      | CPU build; the NPU backend is provided by `torch-rbln` |
-| `torch-rbln`   | `0.2.1`           | registers the `rbln` device + `rbln-ccl` distributed backend |
-| `rebel-compiler` | `0.10.5`        | RBLN SDK / compiler |
-| `diffusers`    | `0.37.1`          | |
-| `transformers` | `5.9.0`           | |
-| `yunchang`     | `0.6.4`           | required for the USP / ring attention import path |
-| `torchvision`  | `0.25.0+cpu`      | *optional*, only needed by some processors (e.g. Qwen-Image-Edit). Must match the torch version. |
+### Software stack (verified set)
+| Package          | Version       | Role |
+| ---              | ---           | ---  |
+| Python           | 3.12          | |
+| `torch`          | `2.10.0+cpu`  | CPU build; NPU support comes from the rebel/torch-rbln stack |
+| `torch-rbln`     | `0.2.1`       | registers the `rbln` device + `rbln-ccl` distributed backend |
+| `rebel-compiler` | `0.10.5`      | **provides the `torch.compile` backend `"rbln"`** (this branch's compute path) |
+| `diffusers`      | `0.37.1`      | |
+| `transformers`   | `5.9.0`       | |
+| `torchvision`    | `0.25.0+cpu`  | optional; only some processors need it (must match the torch version) |
+
+The conv + collective lowering all happen inside `rebel-compiler`'s
+`torch.compile` backend; `torch-rbln` supplies the `rbln` device and the
+`rbln-ccl` process-group backend.
 
 ---
 
 ## 2. Installation
 
-1. **Install the Rebellions SDK** (`rebel-compiler` + `torch-rbln`) following
-   Rebellions' official instructions for your environment. After installation,
-   confirm the backend loads:
+1. **Install the Rebellions SDK** (`rebel-compiler` + `torch-rbln`) per Rebellions'
+   instructions, then confirm both the device and the compile backend are present:
 
    ```bash
-   python -c "import torch, torch_rbln; print(torch.rbln.is_available())"   # -> True
+   python - <<'PY'
+   import torch, torch_rbln
+   from rebel.core.torch_compile import rbln_backend   # the torch.compile backend
+   print("rbln device:", torch.rbln.is_available())
+   PY
    ```
 
-2. **Install xDiT (this repository)** and its dependencies into the same
-   environment:
+2. **Install xDiT (this branch):**
 
    ```bash
    git clone https://github.com/rebel-jueonpark/xDiT.git
    cd xDiT
-   git checkout adopt_atom_npu
-   pip install -e .          # installs xfuser (editable) + deps
+   git checkout adopt_atom_npu_compile
+   pip install -e .
    ```
 
-3. **(Optional) torchvision** — only if you hit a
-   `requires the Torchvision library` error (some image/video processors).
-   Install the version matching your torch, with no deps so it cannot disturb
-   the RBLN torch build:
+3. **(Optional) torchvision** — only if a processor raises
+   `requires the Torchvision library`:
 
    ```bash
    pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torchvision==0.25.0
@@ -68,205 +80,130 @@ rbln-stat            # lists NPUs, memory (15.7 GiB each), utilization
 
 ## 3. Environment setup
 
-The RBLN runtime needs a few environment variables set **before** `torch_rbln`
-is imported. The provided example scripts set these for you via
-`os.environ.setdefault(...)`, but if you write your own launcher, set them first:
+Set the RBLN bootstrap variables **before** `torch_rbln` is imported (the bundled
+launchers do this for you):
 
 ```bash
-export RCCL_FORCE_EXPORT_MEM=1        # required by the rbln-ccl runtime
+export RCCL_FORCE_EXPORT_MEM=1
+export RCCL_PORT_GEN=1                 # multi-NPU rbln-ccl port generation
 export RBLN_ROOT_IP=127.0.0.1
 export RBLN_LOCAL_IP=127.0.0.1
 export MASTER_ADDR=127.0.0.1
-
-# Point at a Hugging Face cache (and token for gated models, e.g. FLUX):
-export HF_HOME=/path/to/your/huggingface_cache
+export HF_HOME=/path/to/huggingface_cache   # + token for gated models
 ```
-
-> **Import order matters.** In any custom script, set the variables above, then
-> `import torch`, then `import torch_rbln` (which registers the `rbln` device and
-> the `rbln-ccl` backend), **before** initializing `torch.distributed`. The
-> bundled examples already do this correctly — use them as a template.
 
 ---
 
-## 4. Quick start (text→image)
+## 4. Enabling the rebel `torch.compile` path
 
-The fastest path is the **model-agnostic runner launcher**,
-`examples/flux2_rbln_example.py`. It builds an `xFuserModelRunner` from the
-`--model` flag and runs it. Launch it with `torchrun` (one process per NPU).
+Compilation is opt-in via `--use_torch_compile`, and the backend is selected by
+`--torch_compile_backend`:
 
-Run **FLUX.2-klein-4B** on a single NPU:
+| `--torch_compile_backend` | Effect |
+| --- | --- |
+| `auto` (default) | `rbln` (rebel-compiler) when an ATOM NPU is present, else `inductor` |
+| `rbln` | force the rebel-compiler backend |
+| `inductor` | force PyTorch Inductor (CPU/GPU) |
+
+On the `rbln` backend xDiT compiles **`pipe.transformer`** with
+`torch.compile(..., backend="rbln", dynamic=False, options={mode:["strict"],
+compile_context, cache_dir, tensor_parallel_size, process_group_dict})`. Compiled
+artifacts are cached under `<output_directory>/rbln_compile_cache/` and reused on
+re-runs.
+
+### Single NPU
 
 ```bash
-torchrun --nproc_per_node=1 --master_port=29500 \
+torchrun --nnodes=1 --nproc_per_node=1 --master_port=29500 \
     examples/flux2_rbln_example.py \
-    --model FLUX.2-klein-4B \
-    --ulysses_degree 1 \
-    --height 512 --width 512 \
-    --num_inference_steps 4 \
+    --model SD3.5 \
+    --use_torch_compile --torch_compile_backend rbln \
+    --ulysses_degree 1 --tensor_parallel_degree 1 \
+    --height 512 --width 512 --num_inference_steps 4 \
     --prompt "a futuristic city at dusk" \
     --output_directory ./outputs
 ```
 
-A `.png` is written to `./outputs/`. The same launcher works for any of the
-runner models in [§5](#5-supported-models-on-atom); just change `--model`:
+### Multiple NPUs (tensor parallelism)
+
+Multi-NPU uses **tensor parallelism** (the rebel backend lowers the TP
+`all_reduce`/`all_gather` onto `rbln-ccl`). Launch one process per NPU and set
+`--tensor_parallel_degree` = number of NPUs:
 
 ```bash
-# Flux.1-dev (12B — loads via host-shared memory, runs slower on one NPU)
-torchrun --nproc_per_node=1 examples/flux2_rbln_example.py \
-    --model FLUX.1-dev --ulysses_degree 1 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_port=29500 \
+    examples/flux2_rbln_example.py \
+    --model <model> \
+    --use_torch_compile --torch_compile_backend rbln \
+    --tensor_parallel_degree 4 --ulysses_degree 1 \
     --height 512 --width 512 --num_inference_steps 4 \
-    --prompt "a red panda astronaut" --output_directory ./outputs
-
-# Z-Image
-torchrun --nproc_per_node=1 examples/flux2_rbln_example.py \
-    --model Z-Image --ulysses_degree 1 \
-    --height 512 --width 512 --num_inference_steps 8 \
-    --prompt "a watercolor fox" --output_directory ./outputs
-
-# Qwen-Image (20B)
-torchrun --nproc_per_node=1 examples/flux2_rbln_example.py \
-    --model Qwen-Image --ulysses_degree 1 \
-    --height 512 --width 512 --num_inference_steps 8 \
-    --prompt "a bowl of ramen, studio photo" --output_directory ./outputs
+    --prompt "..." --output_directory ./outputs
 ```
 
-### Common arguments
-| Flag | Meaning |
-| --- | --- |
-| `--model` | Registry name or HF id (e.g. `FLUX.2-klein-4B`, `FLUX.1-dev`, `Z-Image`, `Qwen-Image`). |
-| `--ulysses_degree` | Sequence-parallel degree. **Keep at `1`** on ATOM (see [Limitations](#7-limitations)). |
-| `--height` / `--width` | Output resolution. |
-| `--num_inference_steps` | Denoising steps. |
-| `--num_frames` | Video frame count (video models). |
-| `--prompt` | Text prompt (quote it). |
-| `--seed` | RNG seed (default 42). |
-| `--output_directory` | Where outputs (`.png`/`.mp4`) are written. |
-| `--input_images` | Input image(s) for image-conditioned / edit models. |
-| `--task` | Task selector for multi-task models (e.g. `t2v`). |
+> Use **tensor parallelism**, not sequence parallelism, on this path:
+> rebel-compiler lowers `all_reduce`/`all_gather` in-graph but **not `all_to_all`**,
+> so xDiT's USP/Ulysses (`--ulysses_degree > 1`) cannot be compiled here. Keep
+> `--ulysses_degree 1`.
 
 ---
 
-## 5. Supported models on ATOM
+## 5. Static shapes
 
-Empirically validated on this branch (single NPU). The dividing line is the
-**patch-embed type**: models that patchify with a `Linear` run today; models
-that patchify with a `Conv` do not yet (the NPU lacks an eager `convolution`
-kernel — see [Troubleshooting](#8-troubleshooting)).
+The rebel backend requires `dynamic=False` (static shapes). A separate compiled
+artifact is produced/cached per distinct `(height, width, batch, sequence)`. Keep
+resolution, batch, and CFG mode fixed for a given run; changing them recompiles.
 
-| Model | Status | Notes |
+---
+
+## 6. Status & roadmap
+
+The work is staged. **Stage 1a (backend wiring) is done and verified at the op
+level; full models are being brought up.**
+
+| Stage | Goal | Status |
 | --- | --- | --- |
-| **Flux.1-dev** | ✅ works | single NPU |
-| **Flux.2-klein (4B)** | ✅ works | single NPU |
-| **Z-Image / Z-Image-Turbo** | ✅ works | single NPU |
-| **Qwen-Image** | ✅ works | 20B; loads via host-shared memory |
-| **CogVideoX (-2b)** | ✅ works | use `examples/cogvideox_rbln_example.py` (see §6) |
-| **Stable Diffusion 3.5** | ❌ not yet | conv2d patch-embed (`convolution_overrideable`) |
-| **Qwen-Image-Edit** | ❌ not yet | conv3d patch-embed |
-| **Wan2.x / video runner models** | ❌ not yet | conv3d patch-embed |
-| **Flux Kontext** | ❌ not yet | CPU/NPU device mismatch on edit conditioning |
-| **PixArt, SANA, SDXL, HunyuanDiT, Latte, …** | ❌ not yet | legacy pipeline path has no RBLN adapter |
+| **1a — backend wiring** | route `pipe.transformer` through `torch.compile(backend="rbln")` | ✅ done; conv2d/conv3d + bf16 SDPA verified compiling on one NPU |
+| **1b — single-NPU full model** | compile a whole DiT transformer end-to-end | 🚧 in progress (see blockers) |
+| **2 — multi-NPU FFN-TP** | FeedForward tensor parallelism, collectives via rbln-ccl | ⏳ planned |
+| **3 — attention TP** | Megatron-style column/row-parallel attention | ⏳ planned |
+
+**Current bring-up blockers (Stage 1b):**
+- **Flux / Flux2 / Qwen-Image** — rebel traces the full DiT but conversion fails on
+  two unimplemented ops: **`aten::outer`** (RoPE) and **`aten::rms_norm`** (QK-norm).
+  These need rebel-compiler converters/decompositions, or model-level decomposition.
+- **SD3.5** — uses neither of those ops (only conv2d), but its transformer forward
+  currently routes to Inductor instead of the rebel backend; that routing needs
+  fixing before it compiles on the NPU.
+
+Because rebel supports conv, the eventual model coverage on this path is broader
+than the eager branch (it should include the conv-patchify DiTs and VAEs that
+eager cannot run) — pending the items above.
 
 ---
 
-## 6. Running video (CogVideoX)
-
-CogVideoX uses the legacy pipeline path with a dedicated RBLN adapter,
-`examples/cogvideox_rbln_example.py`. Run on a single NPU **without** the
-CPU-offload flag (manual placement keeps the conv patch-embed and VAE on CPU and
-the transformer on the NPU):
-
-```bash
-export XDIT_RBLN_OUTPUT=./outputs        # where the .mp4 is written
-python examples/cogvideox_rbln_example.py \
-    --model THUDM/CogVideoX-2b \
-    --height 480 --width 720 --num_frames 9 \
-    --num_inference_steps 4 \
-    --prompt "a tiny astronaut riding a horse on the moon" \
-    --seed 42
-```
-
-The `.mp4` is written to `$XDIT_RBLN_OUTPUT`. Avoid `--enable_model_cpu_offload`
-here — it moves the conv patch-embed back onto the NPU and conflicts with the
-adapter's manual CPU placement.
-
----
-
-## 7. Limitations
-
-- **Single NPU only (for now).**
-  - **Sequence Parallelism** (`--ulysses_degree > 1`) currently fails — the
-    all-to-all polyfill's underlying `rbln-ccl` AllGather errors. Keep
-    `--ulysses_degree 1` and `--nproc_per_node 1`.
-  - **FSDP weight sharding** (`--fully_shard_degree > 1`) is not yet RBLN-ready
-    (its placement path uses CUDA device literals).
-- **Memory is not the wall.** RBLN backs weights with host shared memory, so
-  large models (12B Flux.1-dev, 20B Qwen-Image) *load and run* on a single
-  15.7 GiB NPU — but unsharded, so latency for big models is high.
-- **Conv-based models are not yet supported** (SD3.5, Qwen-Image-Edit, the Wan
-  video family, and the standalone VAE conv path) — see Troubleshooting.
-- **bf16** is the working dtype.
-
----
-
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 | Error / symptom | Cause & fix |
 | --- | --- |
-| `convolution_overrideable not implemented` | The model uses a **Conv** patch-embed/VAE; `torch-rbln` has no eager conv kernel yet. Affects SD3.5, Qwen-Image-Edit, Wan/video. Not user-fixable from xDiT — needs a backend `convolution_overrideable` registration in `torch-rbln`. Use a linear-patchify model meanwhile. |
-| `RCCL AllGather failed with error code: 1` | You set `--ulysses_degree > 1`. Multi-NPU sequence parallelism is not working yet — use `--ulysses_degree 1` and `--nproc_per_node 1`. |
-| `Cannot get CUDA generator without ATen_cuda library` | An older build without the CPU-generator fix. Update to this branch (`adopt_atom_npu`), which routes RNG generators through a device-aware helper. |
-| `Unsafe cast: input has dtype torch.float32 but ... torch.bfloat16` | Missing the scheduler-dtype fix. Update to this branch (the fix is centralized for all runner models). |
-| `requires the Torchvision library` | Install the matching torchvision (see [§2](#2-installation), step 3). |
-| `cat: all inputs must be on the same device, got rbln:0 and cpu` | Image-conditioned/edit model (e.g. Kontext): the CPU-VAE conditioning latents need to be moved back to the NPU before concatenation. Not yet handled. |
-| `Address already in use` / rendezvous errors | A previous `torchrun` is still holding the port. Pick a new `--master_port`, or kill stale processes. |
-| Model weights won't download / `gated` / `401`,`403` | Set `HF_HOME` to a cache with a valid token, and accept the model's license on Hugging Face. |
+| `NotImplementedError: The following operators are not implemented: ['aten::outer', 'aten::rms_norm']` | The DiT uses RoPE/QK-RMSNorm ops the rebel converter lacks (Flux/Qwen family). Pending op support — see [§6](#6-status--roadmap). |
+| `torch._inductor.exc.InductorError` on an `rbln` tensor | The compile fell to **Inductor** instead of the rebel backend. Ensure `--torch_compile_backend rbln` (or `auto` on an NPU) and that the model's `_compile_model` routes through `_compile_transformer_rbln`. |
+| `DiagnosticError: one or more error diagnostics were emitted` | A rebel-compiler lowering error for some op/shape. Run with rebel debug logging to see the op; report it as a missing converter. |
+| `RCCL ... failed` / multi-NPU hangs | Ensure `RCCL_PORT_GEN=1` and the bootstrap env are set; use **tensor parallelism** (`--tensor_parallel_degree N`), not `--ulysses_degree` (`all_to_all` isn't compilable). |
+| `requires the Torchvision library` | Install the matching torchvision ([§2](#2-installation) step 3). |
+| First run is slow | Compilation runs once and is cached under `<output_directory>/rbln_compile_cache/`; subsequent runs reuse the `.rbln` artifact. |
 
 ---
 
-## 9. Writing your own launcher
+## 8. What this branch adds (vs the eager `adopt_atom_npu` branch)
 
-If you need a custom entry point, mirror `examples/flux2_rbln_example.py`:
+- `--torch_compile_backend {auto,inductor,rbln}` (`xfuser/config/args.py`).
+- `base_model._compile_model` dispatches on the backend; `_compile_transformer_rbln`
+  builds the rebel options + a `process_group_dict` from the `GroupCoordinator`s so
+  the backend can lower tensor-parallel collectives onto `rbln-ccl`
+  (`xfuser/model_executor/models/runner_models/base_model.py`).
+- `flux.py` / `stable_diffusion.py` `_compile_model` overrides route through the
+  rebel path (transformer only; text encoders stay eager).
+- `RCCL_PORT_GEN` added to the example launcher for multi-NPU.
 
-```python
-import os
-os.environ.setdefault("RCCL_FORCE_EXPORT_MEM", "1")
-os.environ.setdefault("RBLN_ROOT_IP", "127.0.0.1")
-os.environ.setdefault("RBLN_LOCAL_IP", "127.0.0.1")
-os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-
-import torch            # noqa: E402
-import torch_rbln       # noqa: F401,E402  (registers torch.rbln + rbln-ccl)
-
-from xfuser.config.args import FlexibleArgumentParser, xFuserArgs
-from xfuser.runner import xFuserModelRunner, setup_logging
-
-def main():
-    setup_logging()
-    parser = FlexibleArgumentParser(description="xDiT on Rebellions NPU")
-    args = vars(xFuserArgs.add_runner_args(parser).parse_args())
-    runner = xFuserModelRunner(args)
-    input_args = runner.preprocess_args(args)
-    runner.initialize(input_args)
-    output, timings = runner.run(input_args)
-    runner.save(output=output, timings=timings)
-    runner.cleanup()
-
-if __name__ == "__main__":
-    main()
-```
-
-Launch it with `torchrun --nproc_per_node=1 your_launcher.py --model ... --ulysses_degree 1 ...`.
-
----
-
-## 10. What the branch changes (for reference)
-
-The `adopt_atom_npu` branch adds, on top of upstream xDiT:
-- `rbln` device + `rbln-ccl` backend detection (`xfuser/envs.py`,
-  `parallel_state.py`), device-agnostic utilities (`xfuser/core/device_utils.py`),
-  and a collective-ops polyfill (`xfuser/core/rbln_collectives.py`).
-- Runner-model fixes: device-aware RNG generators and centralized
-  scheduler-dtype / VAE-on-CPU handling so every runner model gets the RBLN
-  treatment (`xfuser/model_executor/models/runner_models/`).
-- RBLN examples: `examples/flux2_rbln_example.py`, `examples/cogvideox_rbln_example.py`.
+It builds on the RBLN device/backend enablement from `adopt_atom_npu` (the `rbln`
+device, `rbln-ccl` selection, and the scheduler-dtype/VAE-on-CPU compat hooks).

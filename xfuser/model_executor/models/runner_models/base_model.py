@@ -1,4 +1,5 @@
 import abc
+import os
 import torch
 import copy
 import argparse
@@ -43,7 +44,13 @@ from xfuser.core.distributed import (
     get_runtime_state,
     init_distributed_environment,
     shard_component,
+    get_dp_group,
+    get_cfg_group,
+    get_sp_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
 )
+from xfuser.core.distributed.parallel_state import get_tp_group
 from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, create_hybrid_attn_schedule, create_hybrid_gemm_schedule
 
@@ -459,13 +466,78 @@ class xFuserModel(abc.ABC):
 
 
 
+    def _resolve_compile_backend(self) -> str:
+        """Choose the torch.compile backend. Default 'auto' -> 'rbln' on RBLN
+        (rebel-compiler: supports conv + lowers in-graph collectives onto rbln-ccl),
+        'inductor' elsewhere."""
+        backend = getattr(self.config, "torch_compile_backend", "auto") or "auto"
+        if backend == "auto":
+            return "rbln" if _is_rbln() else "inductor"
+        return backend
+
     def _compile_model(self, input_args: dict) -> None:
-        """ Compile the model using torch.compile."""
-        torch._inductor.config.reorder_for_compute_comm_overlap = True
-        self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default") # TODO: Configurable
+        """ Compile the transformer using torch.compile (backend-dispatched)."""
+        backend = self._resolve_compile_backend()
+        if backend == "rbln":
+            self._compile_transformer_rbln()
+        else:
+            torch._inductor.config.reorder_for_compute_comm_overlap = True
+            self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
         # two steps to warmup the torch compiler
         input_args["num_inference_steps"] = 2  # Reduce steps for warmup # TODO: make this more generic
         self._run_timed_pipe(input_args)
+
+    def _build_process_group_dict(self) -> dict:
+        """Map each parallel group's c10d process-group name -> its global ranks, so
+        the rebel backend can lower in-graph collectives onto rbln-ccl (mirrors
+        vllm-rbln's `_compile_model`). Only groups with world_size > 1 are included."""
+        pg: dict = {}
+        for getter in (get_tp_group, get_sp_group, get_pp_group, get_dp_group, get_cfg_group):
+            try:
+                grp = getter()
+            except Exception:
+                continue  # group not initialized
+            if grp is None or getattr(grp, "world_size", 1) <= 1:
+                continue
+            for sub in ("device_group", "cpu_group"):
+                g = getattr(grp, sub, None)
+                name = getattr(g, "group_name", None) if g is not None else None
+                if name:
+                    pg[name] = list(grp.ranks)
+        return pg
+
+    def _compile_transformer_rbln(self) -> None:
+        """Compile the transformer with the rebel-compiler torch.compile backend.
+
+        Unlike the eager torch-rbln backend this supports conv2d/conv3d, and given a
+        `process_group_dict` it lowers the transformer's in-graph collectives
+        (all_reduce/all_gather) onto rbln-ccl for tensor parallelism. Static shapes
+        only (`dynamic=False`)."""
+        from rebel.core.torch_compile import rbln_backend
+        try:
+            from rebel import CompileContext
+        except ImportError:  # exact export path may differ across rebel versions
+            from rebel.compile_context import CompileContext
+
+        options = {
+            "tensor_parallel_size": get_tensor_model_parallel_world_size(),
+            "mode": ["strict"],  # raise instead of silently falling back to (broken) eager
+            "compile_context": CompileContext(),
+            "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
+            "cache_dir": os.path.join(self.config.output_directory or ".", "rbln_compile_cache"),
+        }
+        pg_dict = self._build_process_group_dict()
+        if pg_dict:
+            options["process_group_dict"] = pg_dict
+        log(f"Compiling transformer with rebel backend "
+            f"(tensor_parallel_size={options['tensor_parallel_size']}, "
+            f"groups={list(pg_dict.keys())})")
+        self.pipe.transformer = torch.compile(
+            self.pipe.transformer,
+            backend=rbln_backend,
+            options=options,
+            dynamic=False,
+        )
 
 
     def run(self, input_args: dict) -> Tuple[DiffusionOutput, list]:

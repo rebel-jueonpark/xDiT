@@ -57,10 +57,15 @@ class xFuserStableDiffusionModel(xFuserModel):
         return pipe
 
     def _compile_model(self, input_args: dict) -> None:
-        self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
-        self.pipe.text_encoder = torch.compile(self.pipe.text_encoder, mode="default")
-        self.pipe.text_encoder_2 = torch.compile(self.pipe.text_encoder_2, mode="default")
-        self.pipe.text_encoder_3 = torch.compile(self.pipe.text_encoder_3, mode="default")
+        if self._resolve_compile_backend() == "rbln":
+            # rebel path: compile only the transformer (handles conv2d patch-embed);
+            # keep the three text encoders eager/CPU for now.
+            self._compile_transformer_rbln()
+        else:
+            self.pipe.transformer = torch.compile(self.pipe.transformer, mode="default")
+            self.pipe.text_encoder = torch.compile(self.pipe.text_encoder, mode="default")
+            self.pipe.text_encoder_2 = torch.compile(self.pipe.text_encoder_2, mode="default")
+            self.pipe.text_encoder_3 = torch.compile(self.pipe.text_encoder_3, mode="default")
         self._run_timed_pipe(input_args)
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:

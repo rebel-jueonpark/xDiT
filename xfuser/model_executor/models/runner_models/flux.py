@@ -86,9 +86,12 @@ class xFuserFluxModel(xFuserModel):
             _setup_parallel_vae(self.pipe.vae)
 
     def _compile_model(self, input_args: dict) -> None:
-        """ Compile the model using torch.compile."""
-        torch._inductor.config.reorder_for_compute_comm_overlap = True
-        self.pipe.transformer = torch.compile(self.pipe.transformer, mode="reduce-overhead") # Better perf for FLUX.1
+        """ Compile the transformer using torch.compile (backend-dispatched)."""
+        if self._resolve_compile_backend() == "rbln":
+            self._compile_transformer_rbln()  # rebel-compiler (conv + rbln-ccl collectives)
+        else:
+            torch._inductor.config.reorder_for_compute_comm_overlap = True
+            self.pipe.transformer = torch.compile(self.pipe.transformer, mode="reduce-overhead")  # Better perf for FLUX.1
         # two steps to warmup the torch compiler
         input_args["num_inference_steps"] = 2
         self._run_timed_pipe(input_args)
