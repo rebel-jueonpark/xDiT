@@ -13,11 +13,12 @@ parallelism.
 > collectives (`all_reduce`/`all_gather`) onto `rbln-ccl`** for multi-NPU tensor
 > parallelism — the same technique `vllm-rbln` uses for LLMs.
 
-> **Status — work in progress (Stage 1a).** The compile backend is wired into xDiT
-> and the foundational ops are verified compiling on one NPU (conv2d/conv3d and
-> bf16 SDPA). Full end-to-end model bring-up and multi-NPU TP are still in
-> progress — see [§6 Status & roadmap](#6-status--roadmap) for exactly what works
-> and what's pending.
+> **Status — Stage 1a done, Stage 1b actively unblocking.** Backend wiring is done
+> and verified on representative micro-graphs (conv2d/conv3d, bf16 SDPA, `outer`,
+> `rms_norm`). The Flux/Qwen-Image RoPE + QK-RMSNorm path now lowers cleanly
+> after the `aten::outer` / `aten::rms_norm` decomposition fix landed
+> ([§6](#6-status--roadmap), [§7](#7-troubleshooting)). Full end-to-end model
+> bring-up and multi-NPU TP are still in progress.
 
 ---
 
@@ -31,50 +32,102 @@ rbln-stat            # lists NPUs (15.7 GiB each), utilization
 ```
 
 ### Software stack (verified set)
-| Package          | Version       | Role |
-| ---              | ---           | ---  |
-| Python           | 3.12          | |
-| `torch`          | `2.10.0+cpu`  | CPU build; NPU support comes from the rebel/torch-rbln stack |
-| `torch-rbln`     | `0.2.1`       | registers the `rbln` device + `rbln-ccl` distributed backend |
-| `rebel-compiler` | `0.10.5`      | **provides the `torch.compile` backend `"rbln"`** (this branch's compute path) |
-| `diffusers`      | `0.37.1`      | |
-| `transformers`   | `5.9.0`       | |
-| `torchvision`    | `0.25.0+cpu`  | optional; only some processors need it (must match the torch version) |
+| Package          | Version                          | Role |
+| ---              | ---                              | ---  |
+| Python           | 3.12                             | |
+| `torch`          | `2.10.0+cpu`                     | CPU build; NPU support comes from the rebel/torch-rbln stack |
+| `torch-rbln`     | `0.2.1`                          | registers the `rbln` device + `rbln-ccl` distributed backend |
+| `rebel-compiler` | **`0.10.5.dev145+` (source build, see [§2.1](#21-build-rebel-compiler-from-source))** | provides the `torch.compile` backend `"rbln"` |
+| `diffusers`      | `0.37.1`                         | |
+| `transformers`   | `5.9.0`                          | |
+| `torchvision`    | `0.25.0+cpu`                     | optional; only some processors need it (must match the torch version) |
 
 The conv + collective lowering all happen inside `rebel-compiler`'s
 `torch.compile` backend; `torch-rbln` supplies the `rbln` device and the
 `rbln-ccl` process-group backend.
 
+> **About the rebel-compiler version.** The published wheel
+> `rebel-compiler==0.10.4.post1` has a partial-refactor leak: its Pyarmor-built
+> Python pipeline references `SimplifyTransposeOps` and calls several Pass
+> factories with `(batch_size=1)` while the same wheel's `_C.so` exposes the
+> 0-arg form and never registered `SimplifyTransposeOps`. Symptoms include
+> `TVMError: ... expects 0 arguments, but 1 were provided` and
+> `AttributeError: module 'tvm.relay.transform._ffi_api' has no attribute
+> 'SimplifyTransposeOps'`. For now, **build rebel-compiler from source**
+> (instructions below). xfuser ships a runtime safety net for the wheel
+> (`xfuser/core/rbln_compiler_patches.py`) that wraps the affected factories;
+> it is a no-op on the source-built compiler.
+
 ---
 
 ## 2. Installation
 
-1. **Install the Rebellions SDK** (`rebel-compiler` + `torch-rbln`) per Rebellions'
-   instructions, then confirm both the device and the compile backend are present:
+### 2.1 Build rebel-compiler from source
 
-   ```bash
-   python - <<'PY'
-   import torch, torch_rbln
-   from rebel.core.torch_compile import rbln_backend   # the torch.compile backend
-   print("rbln device:", torch.rbln.is_available())
-   PY
-   ```
+```bash
+# Prereqs: conan (>=2.1), cmake, ninja, an x86_64 Linux box, an existing
+# Rebellions SDK install for the dynamic libraries (rblnthunk / rbln-ccl).
+git clone <rebel-compiler-repo> rebel_compiler && cd rebel_compiler
+git submodule update --init
+chmod a+x rebel_install.sh && ./rebel_install.sh       # configures + builds the C++ libs
+source ./dynamic_linking.env                            # exports LD_LIBRARY_PATH for rblnthunk/ccl
 
-2. **Install xDiT (this branch):**
+# Editable Python install (picks up librbln.so from the build dir)
+pip install scikit-build-core pybind11 cython "cmake>=3.26" ninja setuptools_scm
+REBEL_BUILD_DIR=$PWD/build pip install --no-build-isolation -e python/
+```
 
-   ```bash
-   git clone https://github.com/rebel-jueonpark/xDiT.git
-   cd xDiT
-   git checkout adopt_atom_npu_compile
-   pip install -e .
-   ```
+Verify the install picked up the source tree, not the wheel:
 
-3. **(Optional) torchvision** — only if a processor raises
-   `requires the Torchvision library`:
+```bash
+python -c "import rebel; print(rebel.__file__)"
+# expect a path under rebel_compiler/rebel/python/, not site-packages
+python -c "
+import inspect, rebel.core.transform as rt
+print('ComposeExpr sig:', inspect.signature(rt.ComposeExpr))   # expect ()
+print('SimplifyTransposeOps present:', hasattr(rt, 'SimplifyTransposeOps'))  # expect False
+from rebel.core.compilation.torch_to_relay_aten_ops import ATEN_OPS_TO_DECOMPOSE
+import torch
+print('outer registered:', torch.ops.aten.outer.default in ATEN_OPS_TO_DECOMPOSE)
+print('rms_norm registered:', torch.ops.aten.rms_norm.default in ATEN_OPS_TO_DECOMPOSE)
+"
+# expect True for the last two
+```
 
-   ```bash
-   pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torchvision==0.25.0
-   ```
+### 2.2 Install torch + torch-rbln
+
+```bash
+pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip install torch-rbln==0.2.1
+```
+
+Sanity-check both the device and the compile backend are present:
+
+```bash
+python - <<'PY'
+import torch, torch_rbln
+from rebel.core.torch_compile import rbln_backend   # the torch.compile backend
+print("rbln device:", torch.rbln.is_available())
+print("device count:", torch.rbln.device_count())
+PY
+```
+
+### 2.3 Install xDiT (this branch)
+
+```bash
+git clone https://github.com/rebel-jueonpark/xDiT.git
+cd xDiT
+git checkout adopt_atom_npu_compile
+pip install -e .
+```
+
+### 2.4 (Optional) torchvision
+
+Only if a processor raises `requires the Torchvision library`:
+
+```bash
+pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torchvision==0.25.0
+```
 
 ---
 
@@ -163,17 +216,37 @@ level; full models are being brought up.**
 | Stage | Goal | Status |
 | --- | --- | --- |
 | **1a — backend wiring** | route `pipe.transformer` through `torch.compile(backend="rbln")` | ✅ done; conv2d/conv3d + bf16 SDPA verified compiling on one NPU |
-| **1b — single-NPU full model** | compile a whole DiT transformer end-to-end | 🚧 in progress (see blockers) |
+| **1a.5 — RoPE + QK-RMSNorm ops** | `aten::outer` and `aten::rms_norm` (Flux/Qwen family) | ✅ done via decomposition through existing primitives; mini-graph compiles and runs on `rbln:0` |
+| **1b — single-NPU full model** | compile a whole DiT transformer end-to-end | 🚧 in progress |
 | **2 — multi-NPU FFN-TP** | FeedForward tensor parallelism, collectives via rbln-ccl | ⏳ planned |
 | **3 — attention TP** | Megatron-style column/row-parallel attention | ⏳ planned |
 
-**Current bring-up blockers (Stage 1b):**
-- **Flux / Flux2 / Qwen-Image** — rebel traces the full DiT but conversion fails on
-  two unimplemented ops: **`aten::outer`** (RoPE) and **`aten::rms_norm`** (QK-norm).
-  These need rebel-compiler converters/decompositions, or model-level decomposition.
-- **SD3.5** — uses neither of those ops (only conv2d), but its transformer forward
-  currently routes to Inductor instead of the rebel backend; that routing needs
-  fixing before it compiles on the NPU.
+**Bring-up history (Stage 1a.5).** The original Flux/Qwen-Image blocker —
+`NotImplementedError: ['aten::outer', 'aten::rms_norm']` — is resolved by
+extending rebel-compiler's `ATEN_OPS_TO_DECOMPOSE` set so PyTorch's
+`torch.export.default_decompositions()` rewrites both ops into primitives the
+frontend already supports:
+
+- `aten.outer.default` → `aten.view` + `aten.mul`
+- `aten.rms_norm.default` → `aten._fused_rms_norm.default` → `aten.pow` +
+  `aten.mean.dim` + `aten.add.Scalar` + `aten.rsqrt.default` + `aten.mul.Tensor` +
+  `aten.type_as.default`
+
+The change lives in
+`rebel_compiler/rebel/python/rebel/core/compilation/torch_to_relay_aten_ops.py`
+(in the source build) and is also re-applied at runtime by
+`xfuser/core/rbln_compiler_patches.py` as a wheel-compat safety net. Verified by
+a FLUX-style mini-graph (`torch.outer` + `torch.nn.RMSNorm` + RoPE-style fusion)
+that compiles through `RunEarlyCompilation` → `RunLateCompilation` →
+`genCommand: finished` and produces correct output on `rbln:0` (no CPU
+fallback).
+
+**Current Stage 1b targets:**
+- **Flux / Flux2 / Qwen-Image** — `outer` + `rms_norm` no longer block; bring-up
+  now focuses on remaining whole-model patterns surfacing during full forward
+  trace (FFN activations, attention masks, residual paths).
+- **SD3.5** — its transformer forward currently routes to Inductor instead of
+  the rebel backend; that routing needs fixing before it compiles on the NPU.
 
 Because rebel supports conv, the eventual model coverage on this path is broader
 than the eager branch (it should include the conv-patchify DiTs and VAEs that
@@ -185,11 +258,14 @@ eager cannot run) — pending the items above.
 
 | Error / symptom | Cause & fix |
 | --- | --- |
-| `NotImplementedError: The following operators are not implemented: ['aten::outer', 'aten::rms_norm']` | The DiT uses RoPE/QK-RMSNorm ops the rebel converter lacks (Flux/Qwen family). Pending op support — see [§6](#6-status--roadmap). |
+| `NotImplementedError: The following operators are not implemented: ['aten::outer', 'aten::rms_norm']` | **Fixed** in source builds of rebel-compiler — the ops are now decomposed via `ATEN_OPS_TO_DECOMPOSE`. xfuser's `rbln_compiler_patches.py` also re-applies the fix at runtime for the wheel. If you still see this, you're on an older site-packages install — re-do [§2.1](#21-build-rebel-compiler-from-source) and confirm `python -c "import rebel; print(rebel.__file__)"` points at the source tree. |
+| `TVMError: Function relay._transform.ComposeExpr() -> transform.Pass expects 0 arguments, but 1 were provided.` (or the same for `LowerExpr`/`SimplifyExprRebel`/…) | Wheel-only regression in `rebel-compiler==0.10.4.post1`: its frozen `get_preprocess_passes` calls Pass factories with `(batch_size=1)` while the same wheel's `_C.so` only registers the 0-arg form. **Fix:** build rebel-compiler from source ([§2.1](#21-build-rebel-compiler-from-source)). Runtime safety net in `xfuser/core/rbln_compiler_patches.py` wraps the affected factories and retries with 0 args on this specific error. |
+| `AttributeError: module 'tvm.relay.transform._ffi_api' has no attribute 'SimplifyTransposeOps'` | Same wheel-vs-C++ partial refactor: wheel's Python `get_main_passes` references a Pass the wheel's `_C.so` never registered. **Fix:** build rebel-compiler from source. Opt-in runtime fallback `XFUSER_RBLN_STUB_MISSING_PASSES=1` registers an identity stub (lets the pipeline progress but typically segfaults later, since downstream codegen depends on the canonical form that pass would produce). |
+| `ImportError: _C.cpython-…so: undefined symbol: _ZN4rbln6pyvmem5debug4FreeEm` (or another `rbln::...` symbol) | The `librbln.so` in the build dir is **older** than the `vmem.cc`/headers the editable install is building `_C.so` from. Re-run `ninja librbln.so` in the rebel-compiler build dir (the symbol gets added to `librbln.so`), then re-install editable. |
 | `torch._inductor.exc.InductorError` on an `rbln` tensor | The compile fell to **Inductor** instead of the rebel backend. Ensure `--torch_compile_backend rbln` (or `auto` on an NPU) and that the model's `_compile_model` routes through `_compile_transformer_rbln`. |
-| `DiagnosticError: one or more error diagnostics were emitted` | A rebel-compiler lowering error for some op/shape. Run with rebel debug logging to see the op; report it as a missing converter. |
+| `DiagnosticError: one or more error diagnostics were emitted` (generic, in PROD mode) | `rebel.core._env.ENV == "PROD"` suppresses the underlying message. Set it to `"DEV"` temporarily to surface the real error: `python -c "import rebel.core._env as e; e.ENV='DEV'; import rebel.core.build_module; rebel.core.build_module.ENV='DEV'; ..."`. |
 | `RCCL ... failed` / multi-NPU hangs | Ensure `RCCL_PORT_GEN=1` and the bootstrap env are set; use **tensor parallelism** (`--tensor_parallel_degree N`), not `--ulysses_degree` (`all_to_all` isn't compilable). |
-| `requires the Torchvision library` | Install the matching torchvision ([§2](#2-installation) step 3). |
+| `requires the Torchvision library` | Install the matching torchvision ([§2.4](#24-optional-torchvision)). |
 | First run is slow | Compilation runs once and is cached under `<output_directory>/rbln_compile_cache/`; subsequent runs reuse the `.rbln` artifact. |
 
 ---
@@ -204,6 +280,15 @@ eager cannot run) — pending the items above.
 - `flux.py` / `stable_diffusion.py` `_compile_model` overrides route through the
   rebel path (transformer only; text encoders stay eager).
 - `RCCL_PORT_GEN` added to the example launcher for multi-NPU.
+- **`xfuser/core/rbln_compiler_patches.py`** (new): at xfuser import time when
+  `_is_rbln()`, (a) extends `rebel-compiler`'s `ATEN_OPS_TO_DECOMPOSE` set to
+  include `aten.outer.default`, `aten.rms_norm.default`, and
+  `aten._fused_rms_norm.default` so the Flux/Qwen RoPE+QK-RMSNorm graph lowers
+  through existing primitives; (b) installs an adaptive arity guard on the
+  affected `_ffi_api` Pass factories so the broken wheel doesn't trip on
+  `expects 0 arguments, but 1 were provided`; (c) provides an opt-in
+  (`XFUSER_RBLN_STUB_MISSING_PASSES=1`) identity stub for `SimplifyTransposeOps`
+  on the broken wheel. **All three are no-ops on a source-built rebel-compiler.**
 
 It builds on the RBLN device/backend enablement from `adopt_atom_npu` (the `rbln`
 device, `rbln-ccl` selection, and the scheduler-dtype/VAE-on-CPU compat hooks).

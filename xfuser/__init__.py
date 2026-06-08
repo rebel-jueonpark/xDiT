@@ -1,9 +1,12 @@
-# RBLN backend: install collective polyfills before xfuser internals import process groups.
+# RBLN backend: install collective polyfills + rebel-compiler frontend patches
+# before xfuser internals import process groups or invoke torch.compile(backend="rbln").
 try:
     from xfuser.envs import _is_rbln  # noqa: E402
     if _is_rbln():
         from xfuser.core.rbln_collectives import install_rbln_collective_polyfills  # noqa: E402
         install_rbln_collective_polyfills()
+        from xfuser.core.rbln_compiler_patches import install_rbln_compiler_aten_decomp_patches  # noqa: E402
+        install_rbln_compiler_aten_decomp_patches()
 except Exception:
     pass
 
