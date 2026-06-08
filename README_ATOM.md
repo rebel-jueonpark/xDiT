@@ -245,8 +245,13 @@ fallback).
 - **Flux / Flux2 / Qwen-Image** — `outer` + `rms_norm` no longer block; bring-up
   now focuses on remaining whole-model patterns surfacing during full forward
   trace (FFN activations, attention masks, residual paths).
-- **SD3.5** — its transformer forward currently routes to Inductor instead of
-  the rebel backend; that routing needs fixing before it compiles on the NPU.
+- **SD3.5** — base `_compile_model` correctly routes to rebel on NPU and its
+  override calls `_compile_transformer_rbln` (`runner_models/stable_diffusion.py:63`).
+  Remaining work is downstream op coverage during the full transformer compile.
+- **CausalWan / LTX / Hunyuan** — these runners' `_compile_model` overrides
+  hard-code `torch.compile(..., mode="default")` (Inductor) and will fall to
+  CPU/GPU paths on an NPU. Routing them through `_compile_transformer_rbln`
+  is a small follow-up (see [§7](#7-troubleshooting) `InductorError` row).
 
 Because rebel supports conv, the eventual model coverage on this path is broader
 than the eager branch (it should include the conv-patchify DiTs and VAEs that
@@ -256,17 +261,22 @@ eager cannot run) — pending the items above.
 
 ## 7. Troubleshooting
 
-| Error / symptom | Cause & fix |
-| --- | --- |
-| `NotImplementedError: The following operators are not implemented: ['aten::outer', 'aten::rms_norm']` | **Fixed** in source builds of rebel-compiler — the ops are now decomposed via `ATEN_OPS_TO_DECOMPOSE`. xfuser's `rbln_compiler_patches.py` also re-applies the fix at runtime for the wheel. If you still see this, you're on an older site-packages install — re-do [§2.1](#21-build-rebel-compiler-from-source) and confirm `python -c "import rebel; print(rebel.__file__)"` points at the source tree. |
-| `TVMError: Function relay._transform.ComposeExpr() -> transform.Pass expects 0 arguments, but 1 were provided.` (or the same for `LowerExpr`/`SimplifyExprRebel`/…) | Wheel-only regression in `rebel-compiler==0.10.4.post1`: its frozen `get_preprocess_passes` calls Pass factories with `(batch_size=1)` while the same wheel's `_C.so` only registers the 0-arg form. **Fix:** build rebel-compiler from source ([§2.1](#21-build-rebel-compiler-from-source)). Runtime safety net in `xfuser/core/rbln_compiler_patches.py` wraps the affected factories and retries with 0 args on this specific error. |
-| `AttributeError: module 'tvm.relay.transform._ffi_api' has no attribute 'SimplifyTransposeOps'` | Same wheel-vs-C++ partial refactor: wheel's Python `get_main_passes` references a Pass the wheel's `_C.so` never registered. **Fix:** build rebel-compiler from source. Opt-in runtime fallback `XFUSER_RBLN_STUB_MISSING_PASSES=1` registers an identity stub (lets the pipeline progress but typically segfaults later, since downstream codegen depends on the canonical form that pass would produce). |
-| `ImportError: _C.cpython-…so: undefined symbol: _ZN4rbln6pyvmem5debug4FreeEm` (or another `rbln::...` symbol) | The `librbln.so` in the build dir is **older** than the `vmem.cc`/headers the editable install is building `_C.so` from. Re-run `ninja librbln.so` in the rebel-compiler build dir (the symbol gets added to `librbln.so`), then re-install editable. |
-| `torch._inductor.exc.InductorError` on an `rbln` tensor | The compile fell to **Inductor** instead of the rebel backend. Ensure `--torch_compile_backend rbln` (or `auto` on an NPU) and that the model's `_compile_model` routes through `_compile_transformer_rbln`. |
-| `DiagnosticError: one or more error diagnostics were emitted` (generic, in PROD mode) | `rebel.core._env.ENV == "PROD"` suppresses the underlying message. Set it to `"DEV"` temporarily to surface the real error: `python -c "import rebel.core._env as e; e.ENV='DEV'; import rebel.core.build_module; rebel.core.build_module.ENV='DEV'; ..."`. |
-| `RCCL ... failed` / multi-NPU hangs | Ensure `RCCL_PORT_GEN=1` and the bootstrap env are set; use **tensor parallelism** (`--tensor_parallel_degree N`), not `--ulysses_degree` (`all_to_all` isn't compilable). |
-| `requires the Torchvision library` | Install the matching torchvision ([§2.4](#24-optional-torchvision)). |
-| First run is slow | Compilation runs once and is cached under `<output_directory>/rbln_compile_cache/`; subsequent runs reuse the `.rbln` artifact. |
+Each row below is tagged with where it currently applies. Items marked
+**[wheel-only]** do not reproduce on a source-built `rebel-compiler` from
+[§2.1](#21-build-rebel-compiler-from-source) — they are kept here as a paper
+trail for anyone still running `0.10.4.post1` from PyPI.
+
+| Error / symptom | Where it applies | Cause & fix |
+| --- | --- | --- |
+| `NotImplementedError: The following operators are not implemented: ['aten::outer', 'aten::rms_norm']` | **resolved on source build** (also resolved on the wheel by the runtime patch) | The Flux/Qwen-Image RoPE + QK-RMSNorm path used to fail rebel-compiler conversion. Both ops are now decomposed via `torch.export.default_decompositions()` into primitives the frontend already supports — `outer → view+mul`, `rms_norm → _fused_rms_norm → pow+mean.dim+add+rsqrt+mul+type_as`. The source build's `ATEN_OPS_TO_DECOMPOSE` set includes all three overloads; `xfuser/core/rbln_compiler_patches.py` re-applies the same change at runtime for users still on the wheel. Verify with `python -c "import rebel; print(rebel.__file__)"` — should point under `rebel_compiler/rebel/python/`. |
+| `TVMError: Function relay._transform.ComposeExpr() -> transform.Pass expects 0 arguments, but 1 were provided.` (and the same for `LowerExpr` etc.) | **[wheel-only]** `rebel-compiler==0.10.4.post1` | The wheel's frozen `get_preprocess_passes` calls Pass factories with `(batch_size=1)` while the same wheel's `_C.so` only registers the 0-arg form. **Source-built rebel-compiler does not exhibit this** — `inspect.signature(rebel.core.transform.ComposeExpr) == ()` and the C++ side matches. Wheel safety net: `xfuser/core/rbln_compiler_patches.py` wraps the affected `_ffi_api` factories and retries with 0 args on the specific TVMError. (The guard is installed at xfuser import; logs show `Pass-factory arity guard installed on: ComposeExpr, LowerExpr, …`. On a source build it never trips — verify by absence of `stripping N args` debug lines.) |
+| `AttributeError: module 'tvm.relay.transform._ffi_api' has no attribute 'SimplifyTransposeOps'` | **[wheel-only]** `rebel-compiler==0.10.4.post1` | Same wheel-vs-C++ partial-refactor leak: wheel's `get_main_passes` calls `rebel_transform.SimplifyTransposeOps()` but the wheel's `_C.so` never registered it under any name. **Source build does not reference this pass at all** (`hasattr(rebel.core.transform, 'SimplifyTransposeOps') == False`). Fix on the wheel: build from source ([§2.1](#21-build-rebel-compiler-from-source)). The opt-in `XFUSER_RBLN_STUB_MISSING_PASSES=1` identity-Pass fallback lets the pipeline progress but typically segfaults at runtime — downstream codegen depends on the canonical form that pass was supposed to produce. |
+| `ImportError: _C.cpython-…so: undefined symbol: _ZN4rbln6pyvmem5debug4FreeEm` (or another `rbln::...` symbol) | source-build, when `librbln.so` is older than the Python C extension | The build's `librbln.so` predates the addition of the symbol that `pyrbln/vmem.cc` references. Re-run `ninja librbln.so` in the rebel-compiler build dir (`source dynamic_linking.env` first so the conan-installed `rbln-ccl` libs are on `LD_LIBRARY_PATH`), then re-do the editable install. Verify with `nm -D build/librbln.so \| grep _ZN4rbln6pyvmem5debug4FreeEm`. |
+| `torch._inductor.exc.InductorError` on an `rbln` tensor | source-build, on models whose runner override `_compile_model` without routing through the rebel path | The base `_compile_model` correctly dispatches `auto → rbln` on an NPU and `rbln → _compile_transformer_rbln`. However, several runner-model overrides still hard-code `torch.compile(..., mode="default")` (Inductor): `runner_models/causal_wan.py`, `runner_models/ltx.py`, `runner_models/hunyuan.py`. Those will fall to Inductor on NPU and fail; fixing requires routing each through `_compile_transformer_rbln`. `flux.py`, `stable_diffusion.py`, and the base path already do the right thing. |
+| `DiagnosticError: one or more error diagnostics were emitted, please check diagnostic render for output.` (no underlying message visible) | source-build only when manually forced, **[wheel-default]** otherwise | The source build defaults `rebel.core._env.ENV = "DEV"` and surfaces the real underlying TVMError. The wheel ships `ENV = "PROD"` which routes any pipeline error through `raise_diagnostic_error_if_prod`, masking it. To surface the actual message on the wheel: `import rebel.core._env as e; e.ENV='DEV'; import rebel.core.build_module; rebel.core.build_module.ENV='DEV'` **before** `torch.compile(backend="rbln")` runs. |
+| `RCCL ... failed` / multi-NPU hangs | source-build and wheel | Make sure the bootstrap env is set (`RCCL_FORCE_EXPORT_MEM=1`, `RCCL_PORT_GEN=1`, `RBLN_ROOT_IP=127.0.0.1`, `RBLN_LOCAL_IP=127.0.0.1`, `MASTER_ADDR=127.0.0.1`) in every rank before `torch_rbln` is imported. Use **tensor parallelism** (`--tensor_parallel_degree N`), not `--ulysses_degree` — `all_to_all` is not compilable into rbln-ccl yet. |
+| `requires the Torchvision library` | both | Install the matching torchvision ([§2.4](#24-optional-torchvision)). |
+| First run is slow | both | Compilation runs once and is cached under `<output_directory>/rbln_compile_cache/`; subsequent runs reuse the `.rbln` artifact. |
 
 ---
 
