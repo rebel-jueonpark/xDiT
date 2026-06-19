@@ -10,3 +10,13 @@ profile/
 xfuser.egg-info/
 dist/*
 *.mp4
+
+# Local Claude / agent state
+.claude/
+
+# rbln_scratch: working area; cache + per-rank artifacts shouldn't be tracked,
+# but the engineering docs and standalone reproducers under it are.
+rbln_scratch/__pycache__/
+rbln_scratch/a2a_cache_rank*/
+rbln_scratch/rank_*/
+rbln_scratch/*.log
