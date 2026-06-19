@@ -26,7 +26,9 @@ handlers an **empty** `vec_pad_values` / `pad_values`. Several functions then in
 `[0]` (or `[i]`) on the empty array and crash, instead of gracefully returning the
 op unchanged the way `PadWhere`/`PadConv` do.
 
-## Fix #1 — APPLIED (advanced the compile past this spot)
+## What's been tried (and what we learned)
+
+### Defensive guard in `PadCclOp` — committed, but does NOT close the live bug
 
 `src/relay/transforms/rbln/pad_op_channels.cc`, `PadCclOp` (~line 2265):
 
@@ -34,9 +36,6 @@ op unchanged the way `PadWhere`/`PadConv` do.
 Array<ObjectRef> PadCclOp(const Call& ref_call, const Array<Expr>& normal_new_args,
                           const ObjectRef& ctx, const Array<Array<IndexExpr>>& vec_pad_values) {
 -  if (vec_pad_values[0].empty()) {
-+  // Symmetric CCL ops (e.g. all_to_all_x with an already-aligned channel dim)
-+  // need no padding -> the framework hands us an empty vec_pad_values; guard the
-+  // [0] access (mirrors PadWhere/PadConv) instead of crashing with IndexError.
 +  if (vec_pad_values.empty() || vec_pad_values[0].empty()) {
     return {ref_call};
   }
@@ -44,9 +43,14 @@ Array<ObjectRef> PadCclOp(const Call& ref_call, const Array<Expr>& normal_new_ar
 }
 ```
 
-Applied as an **uncommitted** change in `~/rebel_compiler`; `librbln.so` rebuilt
-(`ninja -C build librbln.so`). Verified: the crash moved off `PadCclOp` to the
-next spot, confirming the guard is effective.
+Committed to `rebel-compiler` as `fix(pad_channels): guard empty vec_pad_values
+in PadCclOp (defensive)`. Pure belt-and-braces hardening — keeps the existing
+`[0].empty()` check working if a future code path ever delivers a zero-length
+outer `Array`. **Does not fix the live crash**: `push_back_one_arg` always
+pushes one entry per `Call` argument inside `PadChannelsWithZero`
+(`pad_channels.cc:128-144`), so `vec_pad_values` is never zero-length when
+`PadCclOp` is called on this subgraph. With or without this guard, `PadCclOp`
+returns `{ref_call}` cleanly on the symmetric-CCL test.
 
 > Build note: `librbln.so` (target `CXX_SHARED_LIBRARY_LINKER__tvm_Release`) is
 > NOT in ninja's default `all` target, and the CMake glob-recheck can leave the
@@ -54,27 +58,85 @@ next spot, confirming the guard is effective.
 > (`build/CMakeFiles/rbln_compiler_objs.dir/.../pad_op_channels.cc.o`) then
 > `ninja -C build librbln.so`.
 
-## Fix #2 — NEEDED (next empty-array spot)
+### The real crash site (still NEEDS A FIX)
 
-After Fix #1 the crash is inside the `PadChannelsWithZero` machinery
-(`src/relay/transforms/rbln/pad_channels.cc:108`) — an inlined `Array::operator[]`
-on an empty pad array. The C++ backtrace has **no line numbers**, so pinpointing
-needs a local debug build (`-g`, break on `tvm::runtime::ArrayNode` bounds-check,
-or bisect the `vec_pad_values`/`pad_values` accesses). Candidate sites: the
-`push_back_one_arg` device-resident branch (`MakeContribAlignedPad` with a
-zero-size `pad_width`), `AddOpPaddingIfForced`, and any `[0]`/`[i]` on
-`pad_values` reached when all entries are empty.
+Pinpointed by writing a `pytest` regression test against the live IR
+(see `tests/python/test_rebel/test_pass_rebel_pad_channels_ccl.py` — three
+tests at `_R=2, _T=1, _H=64`, channel already 64-aligned, matching the IR
+captured in `rbln_scratch/rank_0/tvm_debug.log`). Key finding from comparing
+runs with/without the `PadCclOp` guard:
 
-## Recommended proper fix
+- A pure-pytest run on the symmetric `all_to_all_x` subgraph **does not crash**
+  (with or without the `PadCclOp` defensive guard).
+- The live FLUX.2 + Ulysses run **does crash** with
+  `InternalError: indexing 0 on an array of size 0` from
+  `PadChannelsWithZero<PadChannelsTransformMemorizer>`.
 
-Harden the pass for **no-padding CCL ops** rather than per-spot band-aids:
-- treat `fannotate_ccl` ops whose channel dims are already aligned as no-pad
-  (return unchanged / terminator) early in `PadChannelsWithZero`, **or**
-- guard every `vec_pad_values`/`pad_values` `[0]`/`[i]` access against empty.
+The only path that's present in the live run but absent in pytest is the
+`IsDeviceResidentInPort(arg)` branch of `pad_channels.cc:135-141`:
 
-MoE is unaffected because its `all_to_all_x` H always pads to 64 (non-empty
-pad values). A unit test with an already-64-aligned `all_to_all_x` would lock
-this in.
+```cpp
+if (rbln::IsDeviceResidentInPort(arg)) {
+  // device-resident input -> MakeContribAlignedPad path with zero pad_width
+  ...
+  vec_pad_values.push_back(/* empty Array<IndexExpr> for this slot */);
+}
+```
+
+`IsDeviceResidentInPort` consults `GetDevicePortInfo`, which in turn returns
+the `port_info_` populated by `rbln_port_config.cc:61` — and that only fires
+when `rbln::CompileSessionManager::GetCurrentSession()` is non-null. A pytest
+unit test does not set up a compile session, so this branch is unreachable
+from the standalone test scope. Inside the live `torch.compile(backend="rbln")`
+call there *is* an active session, and one of the inputs to the symmetric
+`all_to_all_x` (likely `send_sizes`, materialised as a uint16 device slot via
+`a2a_cast_u16 → cat`) is marked device-resident → the `MakeContribAlignedPad`
+path runs with a zero-size `pad_width` → an empty `Array<IndexExpr>` is pushed
+onto `vec_pad_values` → downstream `[0]` / `[i]` access on that empty slot
+crashes.
+
+## Fix #2 — NEEDED
+
+Two viable patches in `src/relay/transforms/rbln/pad_channels.cc`:
+
+1. **Early-return for already-aligned `fannotate_ccl` ops** in
+   `PadChannelsWithZero` (before reaching the `IsDeviceResidentInPort`
+   branch). The cleanest fix: a symmetric CCL op whose channel dim is
+   already aligned has nothing to pad, regardless of whether one of its
+   inputs is device-resident.
+
+2. **Guard `MakeContribAlignedPad`-with-zero-`pad_width`** in the
+   device-resident branch (`pad_channels.cc:135-141`) so it does not push
+   an empty `Array<IndexExpr>` onto `vec_pad_values`, and add empty-checks
+   on every downstream `vec_pad_values[i]` / `pad_values[i]` access in
+   `PadChannelsWithZero` so they treat an empty entry as "skip this slot".
+
+(1) is preferable: it's one early-return, it's symmetric to how `MoE`'s
+`all_to_all_x` is handled (whose `H` always pads to 64, so it never hits
+the no-pad case), and the unit tests in `test_pass_rebel_pad_channels_ccl.py`
+already lock in the no-crash behaviour for both code paths.
+
+## Regression test (already in the repo)
+
+`tests/python/test_rebel/test_pass_rebel_pad_channels_ccl.py` ships three tests:
+
+1. `test_pad_channels_symmetric_all_to_all_x_does_not_crash` — full live-IR
+   shape (`send_buffer (R=2, t=1, H=64)` bf16 → `add` → `all_to_all_x`).
+2. `test_pad_channels_bare_symmetric_all_to_all_x_does_not_crash` — narrowest
+   reproducer (bare `all_to_all_x(var, const_send_sizes)`).
+3. `test_pad_channels_symmetric_ccl_with_io_attrs_does_not_crash` — attaches
+   the `input_attrs={"device":"rbln",...}` / `output_attrs` the live converter
+   emits. Wrapped in a `try/except` that flips to `xfail` with the documented
+   `indexing 0 on an array of size 0` signature if/when the device-resident
+   branch ever becomes reachable from unit-test scope (or any new code path
+   reaches the same empty-array crash without a `CompileSession`). Any other
+   exception propagates as a real failure.
+
+All three currently **PASS** in pure pytest scope because the live crash
+path requires an active `CompileSession`. Together they're the regression
+canary: when Fix #2 lands, they stay green; if anyone reintroduces an
+unguarded `vec_pad_values[0]` access along a path reachable from unit tests,
+test #3 flips to xfail with the exact diagnostic.
 
 ## Reproduce
 
