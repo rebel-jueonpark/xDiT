@@ -69,10 +69,20 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 def _sdpa_all_to_all_single(x):
     if envs._is_rbln():
-        # rbln-ccl doesn't expose alltoall_base — emulate via allgather + slice.
-        from xfuser.core.rbln_collectives import _functional_all_to_all_single
         x_shape = x.shape
         x_flat = x.flatten().contiguous()
+        if torch.compiler.is_compiling():
+            # Under torch.compile(backend="rbln"): lower the all-to-all in-graph to
+            # rcclAllToAllX (the eager allgather+slice polyfill graph-breaks under
+            # strict tracing). ULYSSES_PG's c10d group_name must be present in the
+            # compile process_group_dict (see base_model._build_process_group_dict).
+            from xfuser.core.rbln_alltoall import rbln_all_to_all_flat
+            world_size = get_ulysses_parallel_world_size()
+            group_name = getattr(PROCESS_GROUP.ULYSSES_PG, "group_name", None)
+            x_out = rbln_all_to_all_flat(x_flat, world_size, str(group_name))
+            return x_out.reshape(x_shape)
+        # Eager rbln: rbln-ccl doesn't expose alltoall_base — allgather + slice.
+        from xfuser.core.rbln_collectives import _functional_all_to_all_single
         x_out = _functional_all_to_all_single(x_flat, group=PROCESS_GROUP.ULYSSES_PG)
         return x_out.reshape(x_shape)
     x_shape = x.shape

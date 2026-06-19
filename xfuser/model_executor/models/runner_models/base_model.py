@@ -499,11 +499,19 @@ class xFuserModel(abc.ABC):
                 continue  # group not initialized
             if grp is None or getattr(grp, "world_size", 1) <= 1:
                 continue
-            for sub in ("device_group", "cpu_group"):
+            # device_group/cpu_group cover TP/PP/DP/CFG and the *combined* SP group.
+            # ulysses_group/ring_group are distinct sub-PGs of SP — the Ulysses
+            # all-to-all (rbln_alltoall) targets ulysses_group by name, so it must
+            # be registered too or the rebel runtime can't resolve that collective.
+            for sub in ("device_group", "cpu_group", "ulysses_group", "ring_group"):
                 g = getattr(grp, sub, None)
                 name = getattr(g, "group_name", None) if g is not None else None
                 if name:
-                    pg[name] = list(grp.ranks)
+                    try:
+                        ranks = list(torch.distributed.get_process_group_ranks(g))
+                    except Exception:
+                        ranks = list(grp.ranks)
+                    pg[name] = ranks
         return pg
 
     def _compile_transformer_rbln(self) -> None:
@@ -518,6 +526,11 @@ class xFuserModel(abc.ABC):
             from rebel import CompileContext
         except ImportError:  # exact export path may differ across rebel versions
             from rebel.compile_context import CompileContext
+
+        # Register the all-to-all custom ops + rebel converters before compiling, so
+        # the Ulysses in-graph collective (rbln_alltoall) lowers to rcclAllToAllX.
+        from xfuser.core.rbln_alltoall import ensure_registered
+        ensure_registered()
 
         options = {
             "tensor_parallel_size": get_tensor_model_parallel_world_size(),
