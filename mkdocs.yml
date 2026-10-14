@@ -30,6 +30,7 @@ nav:
       - Installation and containers: runner/installation.md
       - Launch on multiple devices: runner/launching.md
       - Model and hardware examples: runner/examples.md
+      - Rebellions ATOM NPUs: platforms/rbln.md
       - CLI reference: runner/cli.md
   - Optimize inference:
       - Memory and loading: runner/memory.md

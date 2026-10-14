@@ -96,6 +96,22 @@ def _is_npu():
         return False
 
 
+def _is_rbln():
+    """Rebellions ATOM/REBEL NPU through torch-rbln (the ``rbln`` device).
+
+    torch-rbln registers itself through torch's backend autoload entry point, so
+    ``torch.rbln`` exists whenever the wheel is installed; ``is_available`` never
+    raises (torch.cuda parity) and is False without an NPU.
+    """
+    rbln = getattr(torch, "rbln", None)
+    if rbln is None:
+        return False
+    try:
+        return bool(rbln.is_available())
+    except Exception:  # noqa: BLE001 - a broken runtime means "not available"
+        return False
+
+
 def get_device(local_rank: int) -> torch.device:
     if _is_cuda() or _is_hip():
         return torch.device("cuda", local_rank)
@@ -105,6 +121,8 @@ def get_device(local_rank: int) -> torch.device:
         return torch.device("mps")
     elif _is_npu():
         return torch.device("npu", local_rank)
+    elif _is_rbln():
+        return torch.device("rbln", local_rank)
     else:
         return torch.device("cpu")
 
@@ -118,8 +136,21 @@ def get_device_name() -> str:
         return "mps"
     elif _is_npu():
         return "npu"
+    elif _is_rbln():
+        return "rbln"
     else:
         return "cpu"
+
+
+def get_generator_device() -> str:
+    """Device for ``torch.Generator``: the platform device, or cpu on a Rebellions NPU.
+
+    torch-rbln keeps its default generators on the host and ``torch.Generator(device="rbln")``
+    is not a thing; diffusers' ``randn_tensor`` moves CPU-generated noise to the pipeline's
+    execution device, so a CPU generator gives the right result there.
+    """
+    name = get_device_name()
+    return "cpu" if name == "rbln" else name
 
 
 def get_device_version():
@@ -135,6 +166,13 @@ def get_device_version():
         return None
     elif _is_npu():
         return None
+    elif _is_rbln():
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            return _pkg_version("torch-rbln")
+        except Exception:  # noqa: BLE001
+            return None
     else:
         return None
 
@@ -148,6 +186,8 @@ def get_torch_distributed_backend() -> str:
         return "gloo"
     elif _is_npu():
         return "hccl"
+    elif _is_rbln():
+        return "rbln-ccl"
     else:
         raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
@@ -163,6 +203,8 @@ def get_platform() -> str:
         return "mps"
     elif _is_npu():
         return "npu"
+    elif _is_rbln():
+        return "rbln"
     else:
         return "cpu"
 
@@ -348,7 +390,7 @@ class PackagesEnvChecker:
             return False
 
     def check_long_ctx_attn(self):
-        if not (torch.cuda.is_available() or _is_npu()):
+        if not (torch.cuda.is_available() or _is_npu() or _is_rbln()):
             return False
         try:
             from yunchang import (

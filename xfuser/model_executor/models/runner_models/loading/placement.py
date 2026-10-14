@@ -12,12 +12,17 @@ device, so it converts after.
 
 from xfuser.core.distributed import get_world_group
 from xfuser.core.utils.runner_utils import log, rgetattr
-from xfuser.envs import _is_cuda
+from xfuser.envs import _is_cuda, _is_rbln, get_device
 from .format_backends import (
     module_path_is_covered,
     module_paths_overlap,
     prepare_native_transformer_format_load,
 )
+
+
+def _local_device(local_rank):
+    """This rank's device: ``cuda:N`` as in the rest of this module, or its Rebellions NPU."""
+    return get_device(local_rank) if _is_rbln() else f"cuda:{local_rank}"
 
 
 def conversion_filter(module_path, excluded_paths, include_suffixes=None):
@@ -66,11 +71,11 @@ def place_pipeline_components(loader) -> None:
         _convert_fp8_on_host(loader, adapter, local_rank, offload_requested)
 
     if not offload_requested:
-        model.pipe = model.pipe.to(f"cuda:{local_rank}")
+        model.pipe = model.pipe.to(_local_device(local_rank))
     else:
         # Before FP4/FP6 setup, which quantizes a resident component where it lies.
         for name in model._offload_resident_components():
-            getattr(model.pipe, name).to(f"cuda:{local_rank}")
+            getattr(model.pipe, name).to(_local_device(local_rank))
 
     if model.config.use_fp4_gemms:
         if _is_cuda():

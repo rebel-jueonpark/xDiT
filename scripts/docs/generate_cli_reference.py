@@ -24,6 +24,7 @@ GROUP_ORDER = (
     "Attention backends and communication",
     "Sparse attention",
     "Step caching",
+    "Rebellions NPU placement",
     "Benchmarking, profiling, and output",
     "Other options",
 )
@@ -70,7 +71,11 @@ def _category(action: argparse.Action) -> str:
         return "Loading and CPU offload"
     if name.startswith(("vae_", "use_vae_")) or name in {"use_parallel_vae", "enable_tiling", "enable_slicing"}:
         return "VAE memory and layout"
-    if "gemm" in name or name in {"use_torch_compile", "use_fp8_text_encoder"} or name.startswith("fp8_precision_"):
+    if (
+        "gemm" in name
+        or name in {"use_torch_compile", "torch_compile_backend", "use_fp8_text_encoder"}
+        or name.startswith("fp8_precision_")
+    ):
         return "Compilation and GEMM quantization"
     if name.startswith(
         ("attention_", "cross_attention_", "mha_", "hybrid_attn_", "fp8_comms_", "ulysses_sdma_")
@@ -98,6 +103,8 @@ def _category(action: argparse.Action) -> str:
         return "Sparse attention"
     if name.startswith("cache_") or name in {"use_teacache", "use_fbcache"}:
         return "Step caching"
+    if name.startswith("rbln_"):
+        return "Rebellions NPU placement"
     if name.startswith(("profile", "determinism_check")) or name in {
         "num_iterations",
         "warmup_calls",

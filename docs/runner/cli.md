@@ -32,6 +32,7 @@ enable a setting and their `--no-...` spellings disable it.
 - [Attention backends and communication](#attention-backends-and-communication)
 - [Sparse attention](#sparse-attention)
 - [Step caching](#step-caching)
+- [Rebellions NPU placement](#rebellions-npu-placement)
 - [Benchmarking, profiling, and output](#benchmarking-profiling-and-output)
 
 ## Model selection and adapters
@@ -117,6 +118,7 @@ enable a setting and their `--no-...` spellings disable it.
 | Syntax | Parser default | Description |
 | --- | --- | --- |
 | <a id="-use_torch_compile"></a><a id="--use_torch_compile"></a>`--use_torch_compile` | `False` | Compile supported model components with torch.compile, including supported parallel configurations. |
+| <a id="-torch_compile_backend"></a><a id="--torch_compile_backend"></a>`--torch_compile_backend` `{auto,inductor,rbln}` | `'auto'` | torch.compile backend. 'auto' picks 'rbln' (the rebel compiler) on a Rebellions NPU and 'inductor' elsewhere. |
 | <a id="-gemm_quantization"></a><a id="--gemm_quantization"></a>`--gemm_quantization` `VALUE` | `None` | Transformer GEMM precision: none, fp8, fp4, fp6, a6w4, int8, or a supported low=fp4,high=&lt;format&gt; pair. |
 | <a id="-gemm_config"></a><a id="--gemm_config"></a>`--gemm_config` `VALUE` | `None` | Optional YAML file with advanced GEMM target or schedule settings. |
 | <a id="-use_int8_gemms"></a><a id="--use_int8_gemms"></a>`--use_int8_gemms` | `False` | \[Deprecated\] Use --gemm\_quantization int8 for supported transformer targets. |
@@ -190,6 +192,13 @@ enable a setting and their `--no-...` spellings disable it.
 | <a id="-use_fbcache"></a><a id="--use_fbcache"></a>`--use_fbcache` | `False` | \[Deprecated\] Use --cache\_method fbcache instead. |
 | <a id="-cache_method"></a><a id="--cache_method"></a>`--cache_method` `{teacache,fbcache,dbcache,pipefusion}` | `None` | Step cache for supported models. pipefusion requires pipeline parallelism; other methods reject it. |
 | <a id="-cache_config"></a><a id="--cache_config"></a>`--cache_config` `TEXT` | `None` | JSON string of advanced config overrides merged on top of preset defaults. E.g. '{"residual\_diff\_threshold": 0.5, "max\_warmup\_steps": 6}'. Cache-DiT engines use DBCacheConfig fields; in-tree TeaCache/FBCache accept only residual\_diff\_threshold. |
+
+## Rebellions NPU placement
+
+| Syntax | Parser default | Description |
+| --- | --- | --- |
+| <a id="-rbln_text_encoder_device"></a><a id="--rbln_text_encoder_device"></a>`--rbln_text_encoder_device` `{cpu,rbln}` | `'cpu'` | RBLN only: where the text encoders run (default: host). |
+| <a id="-rbln_vae_device"></a><a id="--rbln_vae_device"></a>`--rbln_vae_device` `{cpu,rbln}` | `'rbln'` | RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host. |
 
 ## Benchmarking, profiling, and output
 

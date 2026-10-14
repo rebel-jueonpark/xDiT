@@ -40,6 +40,7 @@
   "xFuserQwenImageModel": {"input": "Text"},
   "xFuserSkyReelsV2I2VModel": {"input": "Text + one image"},
   "xFuserSkyReelsV2T2VModel": {"input": "Text"},
+  "xFuserStableDiffusion3MediumModel": {"input": "Text"},
   "xFuserStableDiffusionModel": {"input": "Text"},
   "xFuserVDNMiniMaxH3Model": {"input": "Text (t2va)", "output": "video + audio"},
   "xFuserWan21I2VModel": {"input": "Text + one image"},

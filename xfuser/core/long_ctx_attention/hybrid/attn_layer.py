@@ -5,7 +5,7 @@ import torch.distributed
 
 import xfuser.envs as envs
 
-if torch.cuda.is_available() or envs._is_npu():
+if torch.cuda.is_available() or envs._is_npu() or envs._is_rbln():
     from yunchang import LongContextAttention
 
     try:

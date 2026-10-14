@@ -127,11 +127,13 @@ class xFuserModelRunner:
 
     def cleanup(self) -> None:
         """Release the initialized pipeline, device caches, and distributed state."""
+        from xfuser.core import device_utils
+
         torch.compiler.reset()
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         del self.model.pipe
         gc.collect()
-        torch.cuda.empty_cache()
+        device_utils.empty_cache()
         get_runtime_state().destroy_distributed_env()
         log("Cleaned up resources.")
 

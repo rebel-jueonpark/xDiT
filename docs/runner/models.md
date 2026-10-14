@@ -67,6 +67,7 @@ Text-encoder TP is separate; see the **Text TP** column.
 | [Qwen-Image-2.1](#model-qwen-image-2-1) | ✓ | — | — | — | ✓ | — | ✓ | — | — |
 | [Qwen-Image-2.1-Turbo](#model-qwen-image-2-1-turbo) | ✓ | — | — | — | ✓ | — | ✓ | — | — |
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D+E |
+| [SD3](#model-sd3) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D |
 | [SD3.5](#model-sd3-5) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | ✓ | ✓ | — | — | ✓ | — | ✓ | — | — |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | ✓ | ✓ | — | — | ✓ | — | ✓ | — | — |
@@ -129,6 +130,7 @@ not the entire model. Text FP8 is a separate opt-in for supported encoders.
 | [Qwen-Image-2.1](#model-qwen-image-2-1) | ✓ | — | — | — | — | — | ✓ | ✓ |
 | [Qwen-Image-2.1-Turbo](#model-qwen-image-2-1-turbo) | ✓ | — | — | — | — | — | ✓ | ✓ |
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
+| [SD3](#model-sd3) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
 | [SD3.5](#model-sd3-5) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | — | — | — | — | — | — | ✓ | ✓ |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | — | — | — | — | — | — | ✓ | ✓ |
@@ -194,6 +196,7 @@ requires a compatible DBCache layout and is described in the PipeFusion guide.
 | [Qwen-Image-2.1](#model-qwen-image-2-1) | — | — | — | — | — |
 | [Qwen-Image-2.1-Turbo](#model-qwen-image-2-1-turbo) | — | — | — | — | — |
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | — | — | `dbcache` | — |
+| [SD3](#model-sd3) | ✓ | — | — | `dbcache` | — |
 | [SD3.5](#model-sd3-5) | ✓ | — | — | `dbcache` | — |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | — | — | — | — | — |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | — | — | — | — | — |
@@ -261,6 +264,7 @@ Optional and task-specific inputs are labeled; check the source for image counts
 | <a id="model-qwen-image-2-1"></a>[Qwen-Image-2.1](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/qwen.py) | `Qwen-Image-2.1`, `Qwen/Qwen-Image-2.1` | Text; optional images | image | `0.41.0` |
 | <a id="model-qwen-image-2-1-turbo"></a>[Qwen-Image-2.1-Turbo](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/qwen.py) | `Qwen-Image-2.1-Turbo`, `Qwen/Qwen-Image-2.1-Turbo` | Text; optional images | image | `0.41.0` |
 | <a id="model-qwen-image-edit"></a>[Qwen-Image-Edit](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/qwen.py) | `Qwen-Image-Edit`, `Qwen-Image-Edit-2509`, `Qwen-Image-Edit-2511`, `Qwen/Qwen-Image-Edit`, `Qwen/Qwen-Image-Edit-2509`, `Qwen/Qwen-Image-Edit-2511` | Text + one image; 2509/2511 require one or more images | image | `0.37.0` |
+| <a id="model-sd3"></a>[SD3](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/stable_diffusion.py) | `SD3`, `SD3-medium`, `stable-diffusion-3-medium`, `stabilityai/stable-diffusion-3-medium-diffusers` | Text | image | Not declared |
 | <a id="model-sd3-5"></a>[SD3.5](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/stable_diffusion.py) | `SD3.5`, `stable-diffusion-3.5-large`, `stabilityai/stable-diffusion-3.5-large` | Text | image | Not declared |
 | <a id="model-skyreels-v2-i2v-14b"></a>[SkyReels-V2-I2V-14B](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/skyreels_v2.py) | `SkyReels-V2-I2V-14B`, `SkyReels-V2-I2V-1.3B`, `Skywork/SkyReels-V2-I2V-14B-540P-Diffusers`, `Skywork/SkyReels-V2-I2V-1.3B-540P-Diffusers` | Text + one image | video | `0.36.0` |
 | <a id="model-skyreels-v2-t2v-14b"></a>[SkyReels-V2-T2V-14B](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/skyreels_v2.py) | `SkyReels-V2-T2V-14B`, `Skywork/SkyReels-V2-T2V-14B-540P-Diffusers` | Text | video | `0.36.0` |
