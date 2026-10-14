@@ -197,7 +197,8 @@ enable a setting and their `--no-...` spellings disable it.
 
 | Syntax | Parser default | Description |
 | --- | --- | --- |
-| <a id="-rbln_text_encoder_device"></a><a id="--rbln_text_encoder_device"></a>`--rbln_text_encoder_device` `{cpu,rbln}` | `'cpu'` | RBLN only: where the text encoders run (default: host). |
+| <a id="-rbln_text_encoder_device"></a><a id="--rbln_text_encoder_device"></a>`--rbln_text_encoder_device` `{cpu,rbln,spare}` | `'cpu'` | RBLN only: where the text encoders run: host (default), every rank's NPU, or one spare NPU. |
+| <a id="-rbln_spare_device"></a><a id="--rbln_spare_device"></a>`--rbln_spare_device` `INT` | `None` | RBLN only: visible NPU index for --rbln\_text\_encoder\_device spare (default: local world size). |
 | <a id="-rbln_vae_device"></a><a id="--rbln_vae_device"></a>`--rbln_vae_device` `{cpu,rbln}` | `'rbln'` | RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host. |
 
 ## Benchmarking, profiling, and output
