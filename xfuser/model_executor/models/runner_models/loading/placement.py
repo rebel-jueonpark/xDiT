@@ -12,7 +12,7 @@ device, so it converts after.
 
 from xfuser.core.distributed import get_world_group
 from xfuser.core.utils.runner_utils import log, rgetattr
-from xfuser.envs import _is_cuda
+from xfuser.envs import _is_cuda, get_device
 from .format_backends import (
     module_path_is_covered,
     module_paths_overlap,
@@ -80,7 +80,7 @@ def place_pipeline_components(loader) -> None:
         _convert_fp8_on_host(loader, adapter, local_rank, offload_requested)
 
     if not offload_requested:
-        model.pipe = model.pipe.to(f"cuda:{local_rank}")
+        model.pipe = model.pipe.to(get_device(local_rank))
 
     if model.config.use_fp4_gemms:
         if _is_cuda():

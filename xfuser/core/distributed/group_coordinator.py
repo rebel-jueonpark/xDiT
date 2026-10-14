@@ -24,6 +24,9 @@ if envs._is_npu():
     print("torch.npu synchronize")
     from torch.npu import synchronize
 
+if envs._is_rbln():
+    from torch.rbln import synchronize
+
 import xfuser.envs as envs
 from xfuser.logger import init_logger
 

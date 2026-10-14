@@ -84,8 +84,13 @@ class xFuserConv2dWrapper(xFuserLayerBaseWrapper):
                     not get_runtime_state().patch_mode
                     or get_runtime_state().num_pipeline_patch == 1
                 ):
-                    self.activation_cache = x
-                    output = self.naive_forward(self.activation_cache)
+                    if get_pipeline_parallel_world_size() > 1:
+                        # Only PipeFusion's patch mode reads the cache. Storing the input
+                        # otherwise is a module-attribute side effect inside the traced
+                        # forward, which under torch.compile turns the graph input into an
+                        # output alias; the RBLN backend rejects that program.
+                        self.activation_cache = x
+                    output = self.naive_forward(x)
                 else:
                     if self.activation_cache is None:
                         self.activation_cache = torch.zeros(

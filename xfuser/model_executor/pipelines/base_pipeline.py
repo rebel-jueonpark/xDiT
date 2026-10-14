@@ -36,8 +36,10 @@ from xfuser.core.distributed import (
     get_dit_group,
 )
 from xfuser.envs import (
+    _is_rbln,
     get_device,
     get_device_name,
+    get_generator_device,
 )
 from xfuser.core.fast_attention import (
     get_fast_attn_enable,
@@ -341,7 +343,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             prompt=prompt,
             use_resolution_binning=input_config.use_resolution_binning,
             num_inference_steps=steps,
-            generator=torch.Generator(device=get_device_name()).manual_seed(42),
+            generator=torch.Generator(device=get_generator_device()).manual_seed(42),
             output_type=input_config.output_type,
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
@@ -357,7 +359,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             # use_resolution_binning=input_config.use_resolution_binning,
             num_inference_steps=steps,
             output_type="latent",
-            generator=torch.Generator(device=get_device_name()).manual_seed(42),
+            generator=torch.Generator(device=get_generator_device()).manual_seed(42),
         )
         get_runtime_state().runtime_config.warmup_steps = warmup_steps
 
@@ -450,6 +452,13 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         self.original_transformer = transformer
         if enable_torch_compile or enable_onediff:
             if getattr(transformer, "forward") is not None:
+                if enable_torch_compile and _is_rbln():
+                    # The rebel compiler, with static shapes and the parallel groups it needs
+                    # for in-graph collectives; Inductor has no NPU backend.
+                    from xfuser.core.rbln_compile import compile_forward
+
+                    compile_forward(transformer)
+                    return transformer
                 if enable_torch_compile:
                     if "flash_attn" in sys.modules:
                         import flash_attn

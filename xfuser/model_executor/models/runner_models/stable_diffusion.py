@@ -1,3 +1,4 @@
+import copy
 import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from xfuser import xFuserStableDiffusion3Pipeline
@@ -108,3 +109,26 @@ class xFuserStableDiffusionModel(xFuserModel):
         )
         images = output.images if output else []
         return DiffusionOutput(images=images, pipe_args=input_args)
+
+
+@register_model("stabilityai/stable-diffusion-3-medium-diffusers")
+@register_model("stable-diffusion-3-medium")
+@register_model("SD3-medium")
+@register_model("SD3")
+class xFuserStableDiffusion3MediumModel(xFuserStableDiffusionModel):
+    """Stable Diffusion 3 medium (2B): the SD3 checkpoint optimum-rbln ships for ATOM.
+
+    Same pipeline class and parallel plan as SD3.5-large; a 24-head transformer and
+    the 28-step / 7.0-guidance defaults of the medium release.
+    """
+
+    attention_heads = 24
+    default_input_values = DefaultInputValues(
+        height=1024,
+        width=1024,
+        num_inference_steps=28,
+        guidance_scale=7.0,
+    )
+    settings = copy.deepcopy(xFuserStableDiffusionModel.settings)
+    settings.model_name = "stabilityai/stable-diffusion-3-medium-diffusers"
+    settings.output_name = "stable_diffusion_3_medium"

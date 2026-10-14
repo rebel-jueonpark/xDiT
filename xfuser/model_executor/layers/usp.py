@@ -1,4 +1,5 @@
 # This file implements USP with torch version >= '2.5.0'
+import os
 import torch
 import functools
 from typing import Tuple
@@ -8,7 +9,11 @@ import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _templated_ring_attention
 import xfuser.envs as envs
 
-if torch.cuda.is_available() or envs._is_npu():
+# Evaluated once: ``_is_rbln`` reaches torch-rbln's C-level ``is_available`` and Dynamo
+# cannot trace that call, so inside a compiled forward it must be a module constant.
+_IS_RBLN = envs._is_rbln()
+
+if torch.cuda.is_available() or envs._is_npu() or _IS_RBLN:
     from yunchang.globals import PROCESS_GROUP
 else:
     PROCESS_GROUP = None
@@ -17,6 +22,7 @@ from xfuser.core.distributed import (
     model_parallel_is_initialized,
     get_sequence_parallel_world_size,
     get_ulysses_parallel_world_size,
+    get_pipeline_parallel_world_size,
     get_ring_parallel_world_size,
     get_ring_parallel_rank,
     get_ulysses_parallel_rank,
@@ -117,10 +123,53 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+# "ingraph": the all-gather is a functional collective the rebel compiler lowers onto
+# rbln-ccl inside the compiled transformer (one device program per step).
+# "eager": the collective runs through the process group outside the graph. Only usable
+# where it does not sit inside nested calls: Dynamo cannot resume a graph break raised
+# inside an inlined function, it skips the whole forward instead.
+_RBLN_A2A_MODE = os.environ.get("XDIT_RBLN_A2A_MODE", "ingraph")
+
+
+def _rbln_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+    """``all_to_all_single`` for the RBLN backend: an all-gather plus a static slice.
+
+    rbln-ccl has no all-to-all, and the rebel compiler lowers the c10d all_reduce /
+    all_gather / reduce_scatter functional collectives in-graph. ``all_gather_tensor``
+    is both: eager through the process group and, under ``torch.compile(backend="rbln")``,
+    one in-graph collective. Each rank keeps the chunk every source addressed to it. The
+    exchange moves ``world_size`` times the bytes of a true all-to-all; the attention
+    compute around it dwarfs that at DiT sequence lengths.
+
+    ``x`` is the flat ``[world_size * chunk]`` buffer ``_sdpa_all_to_all_single`` builds,
+    laid out destination-major like ``all_to_all_single`` expects. The result is a fresh
+    contiguous buffer, source-major like ``all_to_all_single``'s output.
+    """
+    group = PROCESS_GROUP.ULYSSES_PG
+    world_size = torch.distributed.get_world_size(group)
+    rank = torch.distributed.get_rank(group)
+    if os.environ.get("XDIT_RBLN_A2A_IDENTITY", "0") == "1":
+        # Debug knob: skip the exchange (wrong numerics) to test the graph without a collective.
+        return x.contiguous().clone()
+    x = x.contiguous()
+    chunk = x.shape[0] // world_size
+    if _RBLN_A2A_MODE == "eager" and not torch.compiler.is_compiling():
+        gathered = torch.empty((world_size * x.shape[0],), dtype=x.dtype, device=x.device)
+        torch.distributed.all_gather_into_tensor(gathered, x, group=group)
+    else:
+        gathered = _maybe_wait(ft_c.all_gather_tensor(x, gather_dim=0, group=group))
+    # [src, dst, chunk] -> every source's chunk for this rank.
+    return gathered.view(world_size, world_size, chunk)[:, rank, :].reshape(-1).clone()
+
+
 def _sdpa_all_to_all_single(x):
     x_shape = x.shape
     x_dtype = x.dtype
     x = x.flatten()
+    if _IS_RBLN:
+        # No dtype view here: the exchange keeps x's dtype, and the rebel converter reads
+        # ``Tensor.view(dtype)`` as a shape view and fails on the dtype argument.
+        return _rbln_all_to_all_single(x).reshape(x_shape)
     # NCCL does not support FP8 collectives before PyTorch 2.11, view as uint8 (same width) for the transfer.
     if _FP8_NCCL_NEEDS_VIEW and x_dtype in _FP8_DTYPES:
         x = x.view(torch.uint8)
@@ -339,8 +388,15 @@ def _update_and_get_kv_cache(key, value, attn_layer):
 
 
 def _has_kv_cache(attn_layer) -> bool:
-    """Return whether PipeFusion registered a KV cache for this attention layer."""
-    return attn_layer is not None and get_cache_manager().has_cache_entry(attn_layer)
+    """Return whether PipeFusion registered a KV cache for this attention layer.
+
+    Only PipeFusion registers one, so the pipeline degree answers first: the cache lookup
+    itself is a dict membership keyed by the module, which Dynamo cannot trace, and a
+    graph break this deep in the attention call cannot be resumed under torch.compile.
+    """
+    if attn_layer is None or get_pipeline_parallel_world_size() == 1:
+        return False
+    return get_cache_manager().has_cache_entry(attn_layer)
 
 
 def _serves_packed_keys(backend, key, attention_kwargs) -> bool:

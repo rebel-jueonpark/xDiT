@@ -1,4 +1,5 @@
 import abc
+import functools
 import torch
 import copy
 import json
@@ -18,7 +19,10 @@ from xfuser.envs import (
     PACKAGES_CHECKER,
     _is_hip,
     _is_cuda,
+    _is_rbln,
+    get_device_name,
 )
+from xfuser.core import device_utils
 from xfuser.core.utils.outputs_equal import outputs_equal
 from xfuser.core.utils.runner_utils import (
     log,
@@ -65,6 +69,50 @@ from xfuser.model_executor.models.runner_models.loading.quantization_plan import
 packages_info = PACKAGES_CHECKER.get_packages_info()
 
 MODEL_REGISTRY = {}
+
+
+def _pin_module_to_host(module: torch.nn.Module) -> None:
+    """Run ``module`` on the host no matter where its inputs come from.
+
+    Wraps ``forward`` once: every tensor argument is moved to cpu, and tensors in the
+    result go back to the device of the first tensor argument. Used on RBLN for the
+    components that do not fit on the NPU beside the transformer.
+    """
+    if getattr(module, "_xfuser_pinned_to_host", False):
+        return
+    original_forward = module.forward
+
+    def _to(obj, device):
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device) if obj.device != device else obj
+        if isinstance(obj, (list, tuple)):
+            moved = [_to(o, device) for o in obj]
+            return type(obj)(moved) if not hasattr(obj, "_fields") else type(obj)(*moved)
+        if isinstance(obj, dict) and hasattr(obj, "to_tuple"):
+            # transformers / diffusers ModelOutput: a dict subclass that also indexes by
+            # position, so it has to come back as the same class, not a plain dict.
+            return type(obj)(**{k: _to(v, device) for k, v in obj.items()})
+        if isinstance(obj, dict):
+            return type(obj)((k, _to(v, device)) for k, v in obj.items())
+        return obj
+
+    def _first_tensor_device(args, kwargs):
+        for obj in list(args) + list(kwargs.values()):
+            if isinstance(obj, torch.Tensor):
+                return obj.device
+        return None
+
+    @functools.wraps(original_forward)
+    def forward(*args, **kwargs):
+        caller_device = _first_tensor_device(args, kwargs)
+        cpu = torch.device("cpu")
+        out = original_forward(*_to(args, cpu), **_to(kwargs, cpu))
+        if caller_device is None or caller_device == cpu:
+            return out
+        return _to(out, caller_device)
+
+    module.forward = forward
+    module._xfuser_pinned_to_host = True
 
 # Value for min_diffusers_version when a model needs diffusers symbols that no release
 # ships yet, so the only way to run it is a source install of diffusers. Distinct from
@@ -503,9 +551,35 @@ class xFuserModel(abc.ABC):
         if self.config.cache_method:
             self._apply_step_cache()
 
+        if os.environ.get("XDIT_STAGE_TIMING", "0") == "1":
+            self._install_stage_timers()
+
+    def _install_stage_timers(self) -> None:
+        """Time prompt encoding, the transformer calls and VAE decode of every pipeline run.
+
+        Opt-in through ``XDIT_STAGE_TIMING=1``: each boundary synchronizes the device, which
+        serialises work the pipeline would otherwise overlap. The per-stage split is what makes
+        a parallelism comparison readable (the denoising loop is what scales; encoding and
+        decoding do not), so it is worth the cost in a benchmark and nowhere else.
+        """
+        from xfuser.core.utils.stage_timing import StageTimer
+
+        self._stage_timer = StageTimer()
+        pipe = self.pipe
+        module = getattr(pipe, "module", pipe)  # xFuser pipeline wrappers forward attributes
+        if hasattr(module, "encode_prompt"):
+            self._stage_timer.wrap(module, "encode_prompt", "encode")
+        transformer = getattr(module, "transformer", None)
+        if transformer is not None:
+            self._stage_timer.wrap(transformer, "forward", "denoise", count=True)
+        vae = getattr(module, "vae", None)
+        if vae is not None and hasattr(vae, "decode"):
+            self._stage_timer.wrap(vae, "decode", "decode")
+        log("Stage timers installed (encode_prompt / transformer.forward / vae.decode)")
+
     def _local_onload_device(self) -> torch.device:
         """The device this rank offloads to and from, which is never implicitly cuda:0."""
-        return torch.device(f"cuda:{get_world_group().local_rank}")
+        return device_utils.local_device(get_world_group().local_rank)
 
     def _enable_options(self) -> None:
         """Enable model options based on config"""
@@ -863,6 +937,51 @@ class xFuserModel(abc.ABC):
             if _ado is not None and hasattr(_ado, "spmd_check"):
                 _ado.spmd_check = False
 
+    # ------------------------------------------------------------------ #
+    # RBLN (Rebellions NPU): torch.compile through the rebel compiler
+    # ------------------------------------------------------------------ #
+    def _resolve_compile_backend(self) -> str:
+        """'rbln' on a Rebellions NPU unless the CLI pinned a backend, else 'inductor'."""
+        backend = getattr(self.config, "torch_compile_backend", "auto") or "auto"
+        if backend == "auto":
+            return "rbln" if _is_rbln() else "inductor"
+        if backend == "rbln" and not _is_rbln():
+            raise ValueError("--torch_compile_backend rbln needs a Rebellions NPU (torch-rbln reports none).")
+        return backend
+
+    def _get_rbln_compiled_pipe_components(self) -> List[str]:
+        """Components compiled on the rbln path: the transformer, which carries all of the
+        parallelism, plus the VAE decoder when it lives on the NPU. Text encoders are left
+        eager wherever they are; they run once per image and torch-rbln's eager mode or the
+        host handle them."""
+        names = ["transformer"]
+        if getattr(self.config, "rbln_vae_device", "rbln") == "rbln" and getattr(self.pipe, "vae", None) is not None:
+            names.append("vae")
+        return names
+
+    def _compile_model_rbln(self) -> None:
+        """Compile the NPU-resident components through the rebel compiler.
+
+        The pipeline wrapper already compiled the transformer's forward when it was
+        built (xFuserPipelineBaseWrapper with use_torch_compile); this covers any
+        component it did not, and the VAE decode path, which is convolution-only and
+        has no eager implementation on torch-rbln.
+        """
+        from xfuser.core.rbln_compile import compile_forward, compile_vae_decode
+
+        cache_dir = None  # the shared default cache, so artifacts are reused across output dirs
+        pipe = getattr(self.pipe, "module", self.pipe)  # the diffusers pipeline behind the wrapper
+        names = self._get_rbln_compiled_pipe_components()
+        log(f"Compiling for the Rebellions NPU with the rebel compiler (components={names})")
+        for component_name in names:
+            component = getattr(pipe, component_name, None)
+            if component is None:
+                continue
+            if component_name == "vae":
+                compile_vae_decode(component, cache_dir)
+            else:
+                compile_forward(component, cache_dir)
+
     def _compile_model(self, input_args: dict) -> None:
         """Compile pipe components with torch.compile.
 
@@ -871,6 +990,15 @@ class xFuserModel(abc.ABC):
         to avoid dynamo tracing through FSDP2 forward_pre_hooks and fragmenting
         the graph at every block boundary.
         """
+        if self._resolve_compile_backend() == "rbln":
+            self._compile_model_rbln()
+            compile_args = copy.deepcopy(input_args)
+            warmup_steps = self._get_compile_warmup_steps(input_args)
+            if warmup_steps is not None:
+                compile_args["num_inference_steps"] = warmup_steps
+            self._run_compile_warmup(compile_args)
+            return
+
         self._enable_compute_comm_overlap()
 
         mode = self._get_compile_mode()
@@ -1011,9 +1139,9 @@ class xFuserModel(abc.ABC):
                 "Individual iteration timings will not be affected."
             )
 
-        inference_start = torch.cuda.Event(enable_timing=True)
-        inference_end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        inference_start = device_utils.event(enable_timing=True)
+        inference_end = device_utils.event(enable_timing=True)
+        device_utils.synchronize()
 
         inference_start.record()
         for iteration in range(self.config.num_iterations):
@@ -1036,7 +1164,7 @@ class xFuserModel(abc.ABC):
                 )
 
         inference_end.record()
-        torch.cuda.synchronize()
+        device_utils.synchronize()
 
         output = self._gather_dp_outputs(output)
 
@@ -1083,6 +1211,9 @@ class xFuserModel(abc.ABC):
         if not getattr(self.config, "use_torch_compile", False):
             return False
         if self.config.warmup_calls:
+            return False
+        if self._resolve_compile_backend() == "rbln":
+            # The rebel compiler records no CUDA graphs; its compile warmup already ran.
             return False
         if self._get_compile_mode() not in self.CUDAGRAPH_COMPILE_MODES:
             return False
@@ -1217,10 +1348,10 @@ class xFuserModel(abc.ABC):
         self.prepare_run(input_args)
         replica = get_model_replica_group()
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = device_utils.event(enable_timing=True)
+        end = device_utils.event(enable_timing=True)
 
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         replica.barrier()  # aligns all ranks in the replica as closely as possible
 
         start.record()
@@ -1229,6 +1360,11 @@ class xFuserModel(abc.ABC):
         end.synchronize()  # we don't care about other streams if there are any
 
         elapsed_time = start.elapsed_time(end) / 1000  # Convert to seconds
+        timer = getattr(self, "_stage_timer", None)
+        if timer is not None:
+            log(f"Stage timing: {timer.summary(elapsed_time)}", log_from_all_processes=True)
+            timer.record(elapsed_time, self.config.output_directory, get_world_group().rank)
+            timer.reset()
         return out, elapsed_time
 
     def _run_compile_warmup(self, compile_args: dict) -> None:
@@ -1277,6 +1413,7 @@ class xFuserModel(abc.ABC):
         """Hook for any post model-load and state initialization"""
 
         self.loader.materialize_pipeline()
+        self._apply_rbln_component_placement()
 
         if self.config.use_hybrid_attn_schedule:
             self._setup_hybrid_attn_schedule(input_args)
@@ -1289,6 +1426,83 @@ class xFuserModel(abc.ABC):
 
     def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
         return 1
+
+    def _rbln_host_components(self) -> List[str]:
+        """Pipeline components kept on the host on RBLN: the text encoders by default."""
+        names = []
+        if getattr(self.config, "rbln_text_encoder_device", "cpu") == "cpu":
+            names += [n for n in self.pipe.components if n.startswith("text_encoder")]
+        if getattr(self.config, "rbln_vae_device", "rbln") == "cpu" and "vae" in self.pipe.components:
+            names.append("vae")
+        return names
+
+    def _apply_rbln_component_placement(self) -> None:
+        """Move the components that do not belong on the NPU back to the host.
+
+        The loader placed the whole pipeline on ``rbln:N``. A component pinned to the host
+        gets its ``forward`` wrapped so tensors cross to the host on the way in and back to
+        the caller's device on the way out: diffusers' pipelines pass inputs on
+        ``_execution_device`` (the transformer's) and expect results there.
+        """
+        if not _is_rbln():
+            return
+        pinned = self._rbln_host_components()
+        if not pinned:
+            return
+        log(f"RBLN: keeping {pinned} on the host")
+        for name in pinned:
+            component = self.pipe.components.get(name)
+            if not isinstance(component, torch.nn.Module):
+                continue
+            component.to("cpu")
+            _pin_module_to_host(component)
+        if any(n.startswith("text_encoder") for n in pinned):
+            self._share_host_prompt_encoding()
+
+    def _share_host_prompt_encoding(self) -> None:
+        """Encode the prompt once per host and broadcast the embeddings to the other ranks.
+
+        With the text encoders on the host, every rank of a replica would otherwise run
+        T5-XXL on the same prompt at once, sharing the cores: four ranks took 15-19 s each
+        where one rank takes 1.3 s. Rank 0 encodes with every core and the rest receive the
+        tensors over the gloo group. Only for a single data-parallel group, where all ranks
+        hold the same prompts.
+        """
+        world = get_world_group()
+        if world.world_size == 1 or self.config.data_parallel_degree != 1:
+            return
+        pipe = getattr(self.pipe, "module", self.pipe)
+        if not hasattr(pipe, "encode_prompt") or getattr(pipe, "_xfuser_prompt_encoding_shared", False):
+            return
+        original = pipe.encode_prompt
+        cpu_group = world.cpu_group
+        rank0 = world.ranks[0]
+
+        def _to(obj, device):
+            if isinstance(obj, torch.Tensor):
+                return obj.to(device)
+            if isinstance(obj, (list, tuple)):
+                return type(obj)(_to(o, device) for o in obj)
+            return obj
+
+        @functools.wraps(original)
+        def encode_prompt(*args, **kwargs):
+            device = kwargs.get("device") or getattr(pipe, "_execution_device", None)
+            payload = [None]
+            if world.rank == rank0:
+                threads = torch.get_num_threads()
+                torch.set_num_threads(os.cpu_count() or threads)
+                try:
+                    out = original(*args, **kwargs)
+                finally:
+                    torch.set_num_threads(threads)
+                payload = [_to(out, "cpu")]
+            torch.distributed.broadcast_object_list(payload, src=rank0, group=cpu_group)
+            return _to(payload[0], device) if device is not None else payload[0]
+
+        pipe.encode_prompt = encode_prompt
+        pipe._xfuser_prompt_encoding_shared = True
+        log("RBLN: prompt encoding runs on rank 0 only and is broadcast to the other ranks")
 
     def _setup_hybrid_attn_schedule(self, input_args: dict) -> None:
         """
@@ -1370,6 +1584,9 @@ class xFuserModel(abc.ABC):
         randn_tensor requires the generator device to match the tensor's; hardcoding cuda
         breaks when CPU offload runs the pipeline on cpu.
         """
+        if _is_rbln():
+            # torch-rbln keeps its generators on the host; randn_tensor moves the noise over.
+            return torch.Generator(device="cpu").manual_seed(seed)
         return torch.Generator(device=self.pipe._execution_device).manual_seed(seed)
 
     @abc.abstractmethod
@@ -1435,7 +1652,9 @@ class xFuserModel(abc.ABC):
 
         gather_list = [None] * world_group.world_size if world_group.rank == last_rank else None
 
-        torch.distributed.gather_object(send_obj, gather_list, dst=last_rank)
+        # Objects travel as CPU byte tensors; the gloo group serves that on every backend
+        # (rbln-ccl implements no gather at all).
+        torch.distributed.gather_object(send_obj, gather_list, dst=last_rank, group=world_group.cpu_group)
 
         if world_group.rank == last_rank:
             real_outputs = [o for o in gather_list if o is not None]

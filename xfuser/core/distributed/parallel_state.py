@@ -27,6 +27,9 @@ try:
 except ModuleNotFoundError:
     pass
 
+if envs._is_rbln():
+    from torch.rbln import set_device, device_count
+
 from .utils import RankGenerator
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
@@ -267,7 +270,7 @@ def init_distributed_environment(
     # to the correct device. Passing device_id= to init_process_group()
     # instead causes NCCL to use device-side rendezvous, which breaks
     # new_group() calls used by pipefusion and ulysses (NCCL Error 1).
-    if envs.get_device_name() in ["cuda", "musa", "npu"]:
+    if envs.get_device_name() in ["cuda", "musa", "npu", "rbln"]:
         set_device(local_rank)
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (

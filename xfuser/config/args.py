@@ -174,7 +174,14 @@ class xFuserArgs:
     use_parallel_vae: bool = False
     # use_profiler: bool = False
     use_torch_compile: bool = False
+    # auto -> "rbln" (rebel compiler) on a Rebellions NPU, else "inductor"
+    torch_compile_backend: str = "auto"
     use_onediff: bool = False
+    # RBLN (Rebellions NPU) placement. The text encoders of a DiT pipeline do not fit
+    # next to the transformer in one ATOM's memory (SD3's T5-XXL alone is ~9.5 GB), so
+    # they default to the host; the VAE decoder is compiled for the NPU by default.
+    rbln_text_encoder_device: str = "cpu"
+    rbln_vae_device: str = "rbln"
     # Parallel arguments
     # data parallel
     data_parallel_degree: int = 1
@@ -486,6 +493,29 @@ class xFuserArgs:
             "--use_torch_compile",
             action="store_true",
             help="Enable torch.compile to accelerate inference in a single card",
+        )
+        runtime_group.add_argument(
+            "--torch_compile_backend",
+            type=str,
+            default="auto",
+            choices=["auto", "inductor", "rbln"],
+            help="torch.compile backend. 'auto' picks 'rbln' (the rebel compiler, which also lowers "
+            "in-graph collectives onto rbln-ccl) on a Rebellions NPU and 'inductor' elsewhere.",
+        )
+        runtime_group.add_argument(
+            "--rbln_text_encoder_device",
+            type=str,
+            default="cpu",
+            choices=["cpu", "rbln"],
+            help="RBLN only: where the pipeline's text encoders run. They stay on the host by default "
+            "because they do not fit next to the transformer in one ATOM's memory.",
+        )
+        runtime_group.add_argument(
+            "--rbln_vae_device",
+            type=str,
+            default="rbln",
+            choices=["cpu", "rbln"],
+            help="RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host.",
         )
         runtime_group.add_argument(
             "--use_onediff",
@@ -820,6 +850,28 @@ class xFuserArgs:
             "--use_torch_compile",
             action="store_true",
             help="Enable torch.compile to accelerate inference in a single card",
+        )
+        parser.add_argument(
+            "--torch_compile_backend",
+            type=str,
+            default="auto",
+            choices=["auto", "inductor", "rbln"],
+            help="torch.compile backend. 'auto' picks 'rbln' (the rebel compiler) on a Rebellions NPU "
+            "and 'inductor' elsewhere.",
+        )
+        parser.add_argument(
+            "--rbln_text_encoder_device",
+            type=str,
+            default="cpu",
+            choices=["cpu", "rbln"],
+            help="RBLN only: where the text encoders run (default: host).",
+        )
+        parser.add_argument(
+            "--rbln_vae_device",
+            type=str,
+            default="rbln",
+            choices=["cpu", "rbln"],
+            help="RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host.",
         )
         parser.add_argument(
             "--attention_backend",

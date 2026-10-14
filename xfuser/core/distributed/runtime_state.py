@@ -23,6 +23,10 @@ if envs._is_npu():
     from torch.npu import manual_seed as device_manual_seed
     from torch.npu import manual_seed_all as device_manual_seed_all
 
+if envs._is_rbln():
+    from torch.rbln import manual_seed as device_manual_seed
+    from torch.rbln import manual_seed_all as device_manual_seed_all
+
 from xfuser.core.attention import registry as attention_registry
 from xfuser.core.attention.spec import AttentionBackendType
 from xfuser.core.distributed.attention_schedule import AttentionSchedule, GemmPrecisionSchedule
