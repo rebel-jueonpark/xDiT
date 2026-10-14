@@ -23,6 +23,8 @@ from xfuser.envs import (
     get_device_name,
 )
 from xfuser.core import device_utils
+from xfuser.core.rbln_compile import compile_forward
+from xfuser.core.rbln_text_encoders import pin_module_to_device, place_t5_encoder_on_npu
 from xfuser.core.utils.outputs_equal import outputs_equal
 from xfuser.core.utils.runner_utils import (
     log,
@@ -71,48 +73,6 @@ packages_info = PACKAGES_CHECKER.get_packages_info()
 MODEL_REGISTRY = {}
 
 
-def _pin_module_to_host(module: torch.nn.Module) -> None:
-    """Run ``module`` on the host no matter where its inputs come from.
-
-    Wraps ``forward`` once: every tensor argument is moved to cpu, and tensors in the
-    result go back to the device of the first tensor argument. Used on RBLN for the
-    components that do not fit on the NPU beside the transformer.
-    """
-    if getattr(module, "_xfuser_pinned_to_host", False):
-        return
-    original_forward = module.forward
-
-    def _to(obj, device):
-        if isinstance(obj, torch.Tensor):
-            return obj.to(device) if obj.device != device else obj
-        if isinstance(obj, (list, tuple)):
-            moved = [_to(o, device) for o in obj]
-            return type(obj)(moved) if not hasattr(obj, "_fields") else type(obj)(*moved)
-        if isinstance(obj, dict) and hasattr(obj, "to_tuple"):
-            # transformers / diffusers ModelOutput: a dict subclass that also indexes by
-            # position, so it has to come back as the same class, not a plain dict.
-            return type(obj)(**{k: _to(v, device) for k, v in obj.items()})
-        if isinstance(obj, dict):
-            return type(obj)((k, _to(v, device)) for k, v in obj.items())
-        return obj
-
-    def _first_tensor_device(args, kwargs):
-        for obj in list(args) + list(kwargs.values()):
-            if isinstance(obj, torch.Tensor):
-                return obj.device
-        return None
-
-    @functools.wraps(original_forward)
-    def forward(*args, **kwargs):
-        caller_device = _first_tensor_device(args, kwargs)
-        cpu = torch.device("cpu")
-        out = original_forward(*_to(args, cpu), **_to(kwargs, cpu))
-        if caller_device is None or caller_device == cpu:
-            return out
-        return _to(out, caller_device)
-
-    module.forward = forward
-    module._xfuser_pinned_to_host = True
 
 # Value for min_diffusers_version when a model needs diffusers symbols that no release
 # ships yet, so the only way to run it is a source install of diffusers. Distinct from
@@ -1427,46 +1387,125 @@ class xFuserModel(abc.ABC):
     def _calculate_hybrid_attention_step_multiplier(self, input_args: dict) -> int:
         return 1
 
+    def _rbln_text_encoder_mode(self) -> str:
+        """'cpu' (host), 'rbln' (every rank's own NPU) or 'spare' (one NPU beyond the ranks')."""
+        return getattr(self.config, "rbln_text_encoder_device", "cpu") or "cpu"
+
     def _rbln_host_components(self) -> List[str]:
-        """Pipeline components kept on the host on RBLN: the text encoders by default."""
+        """Pipeline components kept off the ranks' NPUs on RBLN: the text encoders by default."""
         names = []
-        if getattr(self.config, "rbln_text_encoder_device", "cpu") == "cpu":
+        if self._rbln_text_encoder_mode() in ("cpu", "spare"):
             names += [n for n in self.pipe.components if n.startswith("text_encoder")]
         if getattr(self.config, "rbln_vae_device", "rbln") == "cpu" and "vae" in self.pipe.components:
             names.append("vae")
         return names
 
-    def _apply_rbln_component_placement(self) -> None:
-        """Move the components that do not belong on the NPU back to the host.
+    def _rbln_encodes_on_this_rank(self) -> bool:
+        """Prompt encoding runs on the first rank of the world and is broadcast from there."""
+        world = get_world_group()
+        return world.world_size == 1 or world.rank == world.ranks[0]
 
-        The loader placed the whole pipeline on ``rbln:N``. A component pinned to the host
-        gets its ``forward`` wrapped so tensors cross to the host on the way in and back to
+    def _rbln_spare_device_index(self) -> int:
+        """The NPU beyond the ranks' own: ``--rbln_spare_device``, else the local world size.
+
+        torchrun gives rank r the visible NPU r, so with N local ranks index N is the first
+        unused one; the launcher has to expose it (``RBLN_DEVICES=0,...,N``).
+        """
+        explicit = getattr(self.config, "rbln_spare_device", None)
+        index = int(explicit) if explicit is not None else int(os.environ.get("LOCAL_WORLD_SIZE", get_world_group().world_size))
+        count = torch.rbln.device_count()
+        if index >= count:
+            raise ValueError(
+                f"--rbln_text_encoder_device spare needs NPU index {index} (one beyond the ranks'), but only {count} "
+                f"NPUs are visible: expose one more through RBLN_DEVICES (0,...,{index} for {index} ranks) or name "
+                "one with --rbln_spare_device."
+            )
+        return index
+
+    def _place_text_encoders_on_spare_npu(self, names: List[str]) -> None:
+        """This rank's text encoders on the spare NPU, compiled by the rebel compiler.
+
+        T5 goes as its blocks with the embedding lookup on the host (see
+        ``xfuser.core.rbln_text_encoders``); the CLIP encoders compile whole, hidden states
+        included. The first pipeline call compiles them (25 s for T5-XXL, 5 to 12 s per
+        CLIP, cached afterwards). Each is called once per prompt, so the compiled programs
+        run in 0.12 s (T5) and under 0.01 s (CLIP) where the host took 0.7 s and 0.1 s.
+        """
+        if self.config.data_parallel_degree != 1:
+            raise ValueError(
+                "--rbln_text_encoder_device spare encodes on rank 0 and broadcasts the embeddings, "
+                "which needs data_parallel_degree 1."
+            )
+        index = self._rbln_spare_device_index()
+        seq_len = getattr(self.config, "max_sequence_length", None) or 256
+        for name in names:
+            component = self.pipe.components.get(name)
+            if not isinstance(component, torch.nn.Module):
+                continue
+            if getattr(getattr(component, "config", None), "model_type", "") == "t5":
+                place_t5_encoder_on_npu(component, index, seq_len)
+            else:
+                compile_forward(component, device=index)
+                pin_module_to_device(component, torch.device("rbln", index))
+        log(f"RBLN: text encoders {names} on the spare NPU rbln:{index} (compiled on first use)")
+
+    def _apply_rbln_component_placement(self) -> None:
+        """Move the components that do not belong on the rank's NPU to the host or a spare NPU.
+
+        The loader placed the whole pipeline on ``rbln:N``. A component pinned elsewhere
+        gets its ``forward`` wrapped so tensors cross over on the way in and come back to
         the caller's device on the way out: diffusers' pipelines pass inputs on
         ``_execution_device`` (the transformer's) and expect results there.
         """
         if not _is_rbln():
             return
-        pinned = self._rbln_host_components()
-        if not pinned:
-            return
-        log(f"RBLN: keeping {pinned} on the host")
-        for name in pinned:
-            component = self.pipe.components.get(name)
-            if not isinstance(component, torch.nn.Module):
-                continue
-            component.to("cpu")
-            _pin_module_to_host(component)
-        if any(n.startswith("text_encoder") for n in pinned):
-            self._share_host_prompt_encoding()
+        mode = self._rbln_text_encoder_mode()
+        host = self._rbln_host_components()
+        spare: List[str] = []
+        if mode == "spare" and self._rbln_encodes_on_this_rank():
+            spare = [n for n in host if n.startswith("text_encoder")]
+            host = [n for n in host if n not in spare]
+        if host:
+            log(f"RBLN: keeping {host} on the host")
+            for name in host:
+                component = self.pipe.components.get(name)
+                if isinstance(component, torch.nn.Module):
+                    pin_module_to_device(component, "cpu")
+        if spare:
+            self._place_text_encoders_on_spare_npu(spare)
+            self._pin_rbln_pipeline_device(device_utils.local_device(get_world_group().local_rank))
+        if mode in ("cpu", "spare"):
+            self._share_prompt_encoding()
 
-    def _share_host_prompt_encoding(self) -> None:
-        """Encode the prompt once per host and broadcast the embeddings to the other ranks.
+    def _pin_rbln_pipeline_device(self, device: torch.device) -> None:
+        """Keep the pipeline's reported device on this rank's NPU.
+
+        diffusers' ``DiffusionPipeline.device`` returns the first non-CPU component in sorted
+        name order, and ``text_encoder`` sorts before ``transformer``: with the text encoders
+        on the spare NPU the pipeline would create its latents there and hand them to a
+        transformer on another device.
+        """
+        pipe = getattr(self.pipe, "module", self.pipe)
+        cls = type(pipe)
+        if not getattr(cls, "_xfuser_device_override", False):
+            original = cls.device
+
+            def device_property(self):
+                pinned = getattr(self, "_xfuser_device", None)
+                return pinned if pinned is not None else original.fget(self)
+
+            cls.device = property(device_property)
+            cls._xfuser_device_override = True
+        pipe._xfuser_device = torch.device(device)
+
+    def _share_prompt_encoding(self) -> None:
+        """Encode the prompt once per world and broadcast the embeddings to the other ranks.
 
         With the text encoders on the host, every rank of a replica would otherwise run
         T5-XXL on the same prompt at once, sharing the cores: four ranks took 15-19 s each
-        where one rank takes 1.3 s. Rank 0 encodes with every core and the rest receive the
-        tensors over the gloo group. Only for a single data-parallel group, where all ranks
-        hold the same prompts.
+        where one rank takes 1.3 s. Rank 0 encodes with every core (or on the spare NPU)
+        and the rest receive the tensors over the gloo group. Only for a single
+        data-parallel group, where all ranks hold the same prompts.
         """
         world = get_world_group()
         if world.world_size == 1 or self.config.data_parallel_degree != 1:

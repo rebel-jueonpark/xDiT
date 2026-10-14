@@ -40,6 +40,7 @@ NPROC=1 examples/rbln/run_sd3.sh                                  # one NPU
 NPROC=2 examples/rbln/run_sd3.sh --use_cfg_parallel               # CFG parallel
 NPROC=2 examples/rbln/run_sd3.sh --ulysses_degree 2               # Ulysses sequence parallel
 NPROC=4 examples/rbln/run_sd3.sh --use_cfg_parallel --ulysses_degree 2
+TEXT_ENCODER_DEVICE=spare NPROC=4 examples/rbln/run_sd3.sh --use_cfg_parallel --ulysses_degree 2   # T5 on a 5th NPU
 ```
 
 The launcher is `torchrun -m xfuser.runner --use_torch_compile --torch_compile_backend
@@ -52,12 +53,21 @@ Runner flags specific to this platform:
 | flag | default | meaning |
 |---|---|---|
 | `--torch_compile_backend {auto,inductor,rbln}` | `auto` | `rbln` on an NPU, `inductor` elsewhere |
-| `--rbln_text_encoder_device {cpu,rbln}` | `cpu` | SD3's T5-XXL (~9.5 GB bf16) does not fit next to the transformer in one ATOM's 16 GB, so the text encoders run on the host by default |
+| `--rbln_text_encoder_device {cpu,rbln,spare}` | `cpu` | SD3's T5-XXL (~9.5 GB bf16) does not fit next to the transformer in one ATOM's 16 GB, so the text encoders run on the host by default. `spare` compiles them for one NPU beyond the ranks' own: rank 0 encodes there and broadcasts the embeddings. The launcher exposes that NPU (`RBLN_DEVICES=0,...,NPROC`) when `TEXT_ENCODER_DEVICE=spare` |
+| `--rbln_spare_device N` | local world size | the visible NPU index `spare` uses |
 | `--rbln_vae_device {rbln,cpu}` | `rbln` | compile the VAE decoder for the NPU, or decode on the host |
 
 Set `XDIT_STAGE_TIMING=1` to log the time spent in prompt encoding, the transformer
 calls and VAE decode of every run (written to `stage_timing_rank<N>.jsonl` in the
 output directory).
+
+With `spare`, T5 is compiled as its 24 blocks only (`xfuser/core/rbln_text_encoders.py`):
+the token embedding is looked up on the host and the relative-position bias, which depends
+only on the static sequence length, is a constant buffer of the program. Compiling the whole
+`T5EncoderModel` traces, but the program failed at its first run in the rebel runtime
+("Transpose axes size mismatch") on the bias' gather-then-permute. The CLIP encoders compile
+whole, hidden states included. On the NPU the encoders take 0.12 s (T5) and under 0.01 s
+(each CLIP) per prompt where the host took 0.7 s and 0.03 to 0.1 s.
 
 ## Parallelism on ATOM
 
@@ -110,7 +120,9 @@ after a warm-up, one host with RBLN-CA25 NPUs, rebel-compiler 0.12.1.dev79+gc6c3
 built from source at that commit (the next dev commit, 0.12.1.dev80+g040db57c, was
 rebuilt and re-checked on one NPU: same per-step time, bit-identical image). The optimum-rbln rows are the compiler's own RSD
 tensor parallelism for comparison (its T5 sits on one extra NPU; xDiT's text encoders
-run on the host, one rank encodes and broadcasts).
+run on the host, one rank encodes and broadcasts). The "+ spare" rows put xDiT's text
+encoders on one extra NPU too (`TEXT_ENCODER_DEVICE=spare`, section above): the same
+per-step time, and 0.3 to 0.4 s of prompt encoding per image instead of 1.7 to 2.4 s.
 
 | | NPUs | s / step | vs 1 NPU | s / image |
 |---|---|---|---|---|
@@ -122,6 +134,11 @@ run on the host, one rank encodes and broadcasts).
 | optimum-rbln RSD tp4 | 4 | 0.434 | 2.51× | 13.1 |
 | xDiT CFG ×2 · Ulysses ×2 | 4 | 0.392 | 2.78× | 13.7 |
 | xDiT Ulysses ×4 | 4 | 0.399 | 2.73× | 14.2 |
+| xDiT, 1 NPU + spare | 1 + 1 | 1.088 | 1.00× | 31.6 |
+| xDiT CFG parallel ×2 + spare | 2 + 1 | 0.557 | 1.96× | 17.1 |
+| xDiT Ulysses ×2 + spare | 2 + 1 | 0.657 | 1.66× | 19.8 |
+| xDiT CFG ×2 · Ulysses ×2 + spare | 4 + 1 | 0.392 | 2.78× | 12.4 |
+| xDiT Ulysses ×4 + spare | 4 + 1 | 0.400 | 2.72× | 12.4 |
 
 ## Known limits
 

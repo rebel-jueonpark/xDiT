@@ -9,6 +9,8 @@
 # Any extra argument is passed to xfuser.runner. RBLN_DEVICES selects the NPUs
 # (torch-rbln's CUDA_VISIBLE_DEVICES); RBLN_NPUS_PER_DEVICE=k makes every rank's logical
 # device k physical NPUs, which the rebel compiler then shards itself (RSD).
+# TEXT_ENCODER_DEVICE=spare puts the text encoders (T5-XXL, CLIP) on one NPU beyond the
+# ranks' own instead of the host; it needs NPROC+1 visible NPUs (set below unless given).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/env.sh"
@@ -19,12 +21,17 @@ NPROC=${NPROC:-1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(( $(nproc) / NPROC ))}
 MODEL=${MODEL:-SD3-medium}
 OUT=${OUT:-./outputs/rbln}
+TEXT_ENCODER_DEVICE=${TEXT_ENCODER_DEVICE:-cpu}
+if [ "${TEXT_ENCODER_DEVICE}" = spare ] && [ -z "${RBLN_DEVICES:-}" ]; then
+  export RBLN_DEVICES=$(seq -s, 0 "${NPROC}")
+fi
 PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 
 torchrun --nnodes=1 --nproc_per_node="${NPROC}" --master_port="${PORT}" \
   -m xfuser.runner \
   --model "${MODEL}" \
   --use_torch_compile --torch_compile_backend rbln \
+  --rbln_text_encoder_device "${TEXT_ENCODER_DEVICE}" \
   --height "${HEIGHT:-1024}" --width "${WIDTH:-1024}" \
   --num_inference_steps "${STEPS:-28}" \
   --prompt "${PROMPT:-A photo of a cat wearing a tiny wizard hat, studio lighting}" \

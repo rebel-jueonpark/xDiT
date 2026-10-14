@@ -82,13 +82,14 @@ def _runtime_device(local_rank: int):
     return local_rank
 
 
-def compile_options(cache_dir: Optional[str] = None) -> dict:
+def compile_options(cache_dir: Optional[str] = None, device: Optional[int] = None) -> dict:
+    """``device`` names an NPU other than this rank's own (a spare one for the text encoders)."""
     world = get_world_group()
     options = {
         "mode": ["strict"],
         "guard_filter_fn": torch.compiler.keep_tensor_guards_unsafe,
         "cache_dir": cache_dir or default_cache_dir(),
-        "device": _runtime_device(world.local_rank),
+        "device": _runtime_device(world.local_rank) if device is None else device,
     }
     if world.world_size > 1:
         options["process_group_dict"] = process_group_dict()
@@ -139,8 +140,10 @@ def _contiguous_inputs_hook(module, args, kwargs):
     return args, kwargs
 
 
-def compile_forward(module: torch.nn.Module, cache_dir: Optional[str] = None) -> torch.nn.Module:
-    """Compile ``module.forward`` in place for the NPU. Idempotent.
+def compile_forward(
+    module: torch.nn.Module, cache_dir: Optional[str] = None, device: Optional[int] = None
+) -> torch.nn.Module:
+    """Compile ``module.forward`` in place for the NPU (this rank's, or ``device``). Idempotent.
 
     Exactly ``module.forward = torch.compile(module.forward)``: the rebel backend
     recognises that form and keeps the module specialized (its weights stay graph
@@ -148,10 +151,11 @@ def compile_forward(module: torch.nn.Module, cache_dir: Optional[str] = None) ->
     """
     if getattr(module, "_xfuser_rbln_compiled", False):
         return module
-    options = compile_options(cache_dir)
+    options = compile_options(cache_dir, device)
     logger.info(
         f"rbln: compiling {type(module).__name__}.forward with the rebel compiler "
-        f"(groups={list(options.get('process_group_dict', {}).keys())}, cache_dir={options['cache_dir']})"
+        f"(device={options['device']}, groups={list(options.get('process_group_dict', {}).keys())}, "
+        f"cache_dir={options['cache_dir']})"
     )
     module.register_forward_pre_hook(_contiguous_inputs_hook, with_kwargs=True, prepend=True)
     module.forward = torch.compile(module.forward, backend="rbln", dynamic=False, options=options)

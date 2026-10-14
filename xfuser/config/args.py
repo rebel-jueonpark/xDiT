@@ -180,7 +180,8 @@ class xFuserArgs:
     # RBLN (Rebellions NPU) placement. The text encoders of a DiT pipeline do not fit
     # next to the transformer in one ATOM's memory (SD3's T5-XXL alone is ~9.5 GB), so
     # they default to the host; the VAE decoder is compiled for the NPU by default.
-    rbln_text_encoder_device: str = "cpu"
+    rbln_text_encoder_device: str = "cpu"  # cpu | rbln | spare (one NPU beyond the ranks', rank 0 encodes)
+    rbln_spare_device: Optional[int] = None  # NPU index for 'spare'; default: the local world size
     rbln_vae_device: str = "rbln"
     # Parallel arguments
     # data parallel
@@ -506,9 +507,18 @@ class xFuserArgs:
             "--rbln_text_encoder_device",
             type=str,
             default="cpu",
-            choices=["cpu", "rbln"],
+            choices=["cpu", "rbln", "spare"],
             help="RBLN only: where the pipeline's text encoders run. They stay on the host by default "
-            "because they do not fit next to the transformer in one ATOM's memory.",
+            "because they do not fit next to the transformer in one ATOM's memory. 'spare' compiles them "
+            "for one NPU beyond the ranks' own (rank 0 encodes there and broadcasts the embeddings); "
+            "expose that NPU with RBLN_DEVICES.",
+        )
+        runtime_group.add_argument(
+            "--rbln_spare_device",
+            type=int,
+            default=None,
+            help="RBLN only: the visible NPU index used by --rbln_text_encoder_device spare "
+            "(default: the local world size, the first NPU no rank uses).",
         )
         runtime_group.add_argument(
             "--rbln_vae_device",
@@ -863,8 +873,14 @@ class xFuserArgs:
             "--rbln_text_encoder_device",
             type=str,
             default="cpu",
-            choices=["cpu", "rbln"],
-            help="RBLN only: where the text encoders run (default: host).",
+            choices=["cpu", "rbln", "spare"],
+            help="RBLN only: where the text encoders run: host (default), every rank's NPU, or one spare NPU.",
+        )
+        parser.add_argument(
+            "--rbln_spare_device",
+            type=int,
+            default=None,
+            help="RBLN only: visible NPU index for --rbln_text_encoder_device spare (default: local world size).",
         )
         parser.add_argument(
             "--rbln_vae_device",
