@@ -66,8 +66,60 @@ def unet_cfg_parallel_monkey_patch_forward(
     return (output,)
 
 
+def _cfg_split_active(unet) -> bool:
+    pipeline = unet._xfuser_cfg_pipeline()
+    return (
+        pipeline is not None
+        and getattr(pipeline, "_guidance_scale", None) is not None
+        and pipeline.do_classifier_free_guidance
+    )
+
+
+def _cfg_shard_pre_hook(unet, args, kwargs):
+    """Forward pre-hook: hand the UNet this CFG rank's half of every batched input."""
+    unet._xfuser_cfg_split = _cfg_split_active(unet)
+    if not unet._xfuser_cfg_split:
+        return None
+    from xfuser.core.rbln_compile import own_buffers
+
+    sample = args[0] if args else kwargs["sample"]
+    batch_size = sample.shape[0]
+    rank = get_cfg_group().rank_in_group
+    # A half is a view into the full batch; a compiled NPU program needs each input in a
+    # buffer of its own (rank 1's half starts mid-allocation).
+    return own_buffers(_cfg_shard(args, batch_size, rank)), own_buffers(_cfg_shard(kwargs, batch_size, rank))
+
+
+def _cfg_gather_hook(unet, args, kwargs, output):
+    """Forward hook: gather both ranks' halves back into the full CFG batch."""
+    if not getattr(unet, "_xfuser_cfg_split", False):
+        return None
+    sample = output[0] if isinstance(output, tuple) else output.sample
+    gathered = get_cfg_group().all_gather(sample.contiguous(), dim=0)
+    if isinstance(output, tuple):
+        return (gathered,) + tuple(output[1:])
+    return UNet2DConditionOutput(sample=gathered)
+
+
+def apply_unet_cfg_parallel_hooks(pipe):
+    """CFG parallel through module hooks instead of a replaced ``forward``.
+
+    Same split and gather as the monkey patch, but ``unet.forward`` stays the module's own:
+    the RBLN backend compiles exactly ``module.forward = torch.compile(module.forward)`` and
+    would otherwise have to trace the collective and the pipeline lookup with it.
+    """
+    pipe.unet._xfuser_cfg_pipeline = weakref.ref(pipe)
+    pipe.unet.register_forward_pre_hook(_cfg_shard_pre_hook, with_kwargs=True)
+    pipe.unet.register_forward_hook(_cfg_gather_hook, with_kwargs=True)
+    return pipe
+
+
 def apply_unet_cfg_parallel_monkey_patch(pipe):
     """Split the UNet batch across the two ranks of the CFG parallel group."""
+    import xfuser.envs as envs
+
+    if envs._is_rbln():
+        return apply_unet_cfg_parallel_hooks(pipe)
     pipe.unet._xfuser_cfg_pipeline = weakref.ref(pipe)
     pipe.unet.forward = types.MethodType(unet_cfg_parallel_monkey_patch_forward, pipe.unet)
     return pipe

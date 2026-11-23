@@ -200,6 +200,8 @@ enable a setting and their `--no-...` spellings disable it.
 | <a id="-rbln_text_encoder_device"></a><a id="--rbln_text_encoder_device"></a>`--rbln_text_encoder_device` `{cpu,rbln,spare}` | `'cpu'` | RBLN only: where the text encoders run: host (default), every rank's NPU, or one spare NPU. |
 | <a id="-rbln_spare_device"></a><a id="--rbln_spare_device"></a>`--rbln_spare_device` `INT` | `None` | RBLN only: visible NPU index for --rbln\_text\_encoder\_device spare (default: local world size). |
 | <a id="-rbln_vae_device"></a><a id="--rbln_vae_device"></a>`--rbln_vae_device` `{cpu,rbln}` | `'rbln'` | RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host. |
+| <a id="-rbln_vae_path"></a><a id="--rbln_vae_path"></a>`--rbln_vae_path` `TEXT` | `None` | RBLN only: directory of a VAE compiled by optimum-rbln to decode the final latents with. |
+| <a id="-rbln_vae_npu"></a><a id="--rbln_vae_npu"></a>`--rbln_vae_npu` `INT` | `None` | RBLN only: index (within RBLN\_DEVICES) of the NPU the --rbln\_vae\_path VAE runs on. |
 
 ## Benchmarking, profiling, and output
 

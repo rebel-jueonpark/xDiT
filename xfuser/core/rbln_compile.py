@@ -137,6 +137,12 @@ def _contiguous(obj):
     return obj
 
 
+def own_buffers(obj):
+    """Public form of the input fix-up: every rbln tensor in ``obj`` in a contiguous buffer of
+    its own (see ``_contiguous``). For callers that slice inputs before a compiled module."""
+    return _contiguous(obj)
+
+
 _DEBUG_INPUTS = os.environ.get("XDIT_RBLN_DEBUG_INPUTS", "0") == "1"
 
 

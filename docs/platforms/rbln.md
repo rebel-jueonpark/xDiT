@@ -55,7 +55,9 @@ Runner flags specific to this platform:
 | `--torch_compile_backend {auto,inductor,rbln}` | `auto` | `rbln` on an NPU, `inductor` elsewhere |
 | `--rbln_text_encoder_device {cpu,rbln,spare}` | `cpu` | SD3's T5-XXL (~9.5 GB bf16) does not fit next to the transformer in one ATOM's 16 GB, so the text encoders run on the host by default. `spare` compiles them for one NPU beyond the ranks' own: rank 0 encodes there and broadcasts the embeddings. The launcher exposes that NPU (`RBLN_DEVICES=0,...,NPROC`) when `TEXT_ENCODER_DEVICE=spare` |
 | `--rbln_spare_device N` | local world size | the visible NPU index `spare` uses |
-| `--rbln_vae_device {rbln,cpu}` | `rbln` | compile the VAE decoder for the NPU, or decode on the host |
+| `--rbln_vae_device {rbln,cpu}` | `rbln` | compile the VAE decoder for the NPU, or decode on the host. Only `AutoencoderKL` decoders compile this way; other VAEs (CogVideoX's causal 3D VAE) decode on the host in float32 unless `--rbln_vae_path` is given |
+| `--rbln_vae_path DIR` | unset | a VAE compiled by optimum-rbln (the pipeline directory or its `vae/`); the last rank decodes the final latents with it |
+| `--rbln_vae_npu N` | first NPU beyond the ranks' (the second with `spare` text encoders) | the visible NPU index that VAE runs on. CogVideoX's VAE holds about 12 GB at 49 frames of 480×720 and does not fit beside the transformer |
 
 Set `XDIT_STAGE_TIMING=1` to log the time spent in prompt encoding, the transformer
 calls and VAE decode of every run (written to `stage_timing_rank<N>.jsonl` in the
@@ -87,7 +89,9 @@ backend compiles each graph with `num_devices=2`; `rbln_compile.py` then hands t
 runtime the rank's physical device list. It composes with xDiT's multi-process
 parallelism (two CFG ranks, each over two NPUs), but measured on SD3-medium the sharded
 batch-1 transformer was slower than one NPU (0.62 vs 0.56 s per call) and the eager glue
-between programs slowed down a lot, so prefer xDiT's own degrees first.
+between programs slowed down a lot, so prefer xDiT's own degrees first. SDXL's UNet is the
+opposite case: its only xDiT layout is CFG ×2, and two NPUs per rank take the step from
+0.376 s to 0.255 s (table below).
 
 ## Writing code the rbln backend can compile
 
@@ -140,6 +144,64 @@ per-step time, and 0.3 to 0.4 s of prompt encoding per image instead of 1.7 to 2
 | xDiT CFG ×2 · Ulysses ×2 + spare | 4 + 1 | 0.392 | 2.78× | 12.4 |
 | xDiT Ulysses ×4 + spare | 4 + 1 | 0.400 | 2.72× | 12.4 |
 
+## Measured: SDXL and CogVideoX-2b (2026-11-20)
+
+rebel-compiler 0.12.1.dev987+g3a445e38, torch-rbln 0.12.1.dev51, optimum-rbln 0.12.1a12,
+`OMP_NUM_THREADS=8` on both sides (shared host). Text encoders on one NPU beyond the denoiser's
+on both sides unless noted.
+
+```bash
+MODEL=SDXL STEPS=30 TEXT_ENCODER_DEVICE=spare NPROC=2 RBLN_DEVICES=0,1,2 \
+    examples/rbln/run_sd3.sh --use_cfg_parallel
+MODEL=SDXL STEPS=30 NPROC=2 RBLN_DEVICES=0,1,2,3 RBLN_NPUS_PER_DEVICE=2 \
+    examples/rbln/run_sd3.sh --use_cfg_parallel            # two NPUs per guidance branch
+MODEL=CogVideoX-2b HEIGHT=480 WIDTH=720 STEPS=50 TEXT_ENCODER_DEVICE=spare NPROC=2 RBLN_DEVICES=0,1,2,3 \
+    examples/rbln/run_sd3.sh --use_cfg_parallel --num_frames 49 --rbln_vae_path <optimum-rbln pipeline dir>
+```
+
+SDXL base 1.0, 1024×1024, 30 steps, guidance 5 (UNet; CFG parallel is its only xDiT layout):
+
+| | denoiser NPUs | s / step | vs 1 NPU | s / image |
+| --- | --- | --- | --- | --- |
+| optimum-rbln RSD tp1 | 1 | 0.758 | 1.00× | 24.3 |
+| xDiT, 1 NPU | 1 | 0.764 | 1.00× | 24.6 |
+| optimum-rbln RSD tp2 | 2 | 0.518 | 1.46× | 16.9 |
+| xDiT CFG parallel ×2 | 2 | 0.376 | 2.03× | 12.6 |
+| optimum-rbln RSD tp4 | 4 | does not compile (GroupNorm 4-way split asserts) | | |
+| xDiT CFG ×2, two NPUs per rank (host text encoders) | 4 | 0.255 | 3.00× | 8.8 |
+
+CogVideoX-2b, 49 frames of 480×720, 50 steps, guidance 6 (VAE on its own NPU on both sides):
+
+| | denoiser NPUs | s / step | vs 1 NPU | s / video | output |
+| --- | --- | --- | --- | --- | --- |
+| optimum-rbln RSD tp1 | 1 | 19.05 | 1.00× | 971 | reference |
+| xDiT, 1 NPU | 1 | 19.51 | 1.00× | 1002 | ok |
+| optimum-rbln RSD tp2 | 2 | 9.68 | 1.97× | 502 | **wrong** (noise; second batch element) |
+| xDiT CFG parallel ×2 | 2 | 9.98 | 1.96× | 525 | ok |
+| xDiT Ulysses ×2 | 2 | does not load: 24.2 GB of device memory needed | | | |
+| optimum-rbln RSD tp4 | 4 | 6.22 | 3.06× | 329 | ok |
+| xDiT CFG ×2 · Ulysses ×2 | 4 | 5.74 | 3.40× | 309 | **degraded** (see Known limits) |
+
+What these models needed beyond SD3:
+
+- A UNet's CFG split goes through forward hooks (`unet_patch.py`): the usual wrapper around
+  `forward` makes the rebel backend treat the module's weights as graph inputs.
+- No 64-bit graph inputs. CogVideoX's positional table is a non-persistent buffer that stays
+  float64 after loading and reaches the compiled graph as an input, and its DDIM scheduler
+  passes int64 timesteps; the NPU has no cast from either (`'rblnTensor.cast' op unsupported
+  cast element type`). The runner model stores the table in the model's dtype (rebuilt for
+  the requested video size) and converts timesteps to float32 in a forward pre-hook.
+- The runtime state picks CogVideoX's 3D patch layout from the diffusers pipeline's class
+  name, so the runner model hands it the pipeline behind the xDiT wrapper.
+- Do not start two multi-rank jobs in the same second: both failed in `RCCL InitWithUniqueId`.
+- On a busy shared host set `OMP_NUM_THREADS` to a small number; rank 0's host-side prompt
+  encoding sizes its thread pool to the cores idle at start-up. The count stays fixed after
+  that, and is left alone when the encoders run on the spare NPU: Dynamo guards compiled code
+  on the thread count, and a changed count reloads the compiled text encoders.
+- The runner executes under `torch.inference_mode()`, where a view has no `_base`. Code that
+  hands a slice to a compiled module has to tell by extent and stride that the tensor is not
+  a whole allocation (`rbln_compile.own_buffers` does).
+
 ## Known limits
 
 - Static shapes: a compiled program is specific to the resolution, batch (CFG doubles
@@ -149,3 +211,11 @@ per-step time, and 0.3 to 0.4 s of prompt encoding per image instead of 1.7 to 2
   convolution); use `--rbln_vae_device cpu` with tiling.
 - Event timing: torch-rbln has no `Event.elapsed_time`, so iteration times are wall
   clock around device syncs.
+- Ulysses at long sequences. With CogVideoX-2b at 49 frames of 480×720 (8,888 tokens per rank),
+  CFG ×2 · Ulysses ×2 computes a wrong result: after one step the latents are 31% (relative L2)
+  from the 1-NPU latents, where CFG ×2 is 1.8% off. At 45 frames the same layout agrees to
+  2.3%. The attention tensors each rank exchanges are 34.1 MB at 49 frames and 31.5 MB at 45,
+  either side of the runtime's 32 MiB shared-memory buffer; the fault is therefore suspected
+  below xDiT (the lowered in-graph all-gather or rbln-ccl), not yet located. Ulysses ×2 without
+  CFG parallel does not load at that size at all (24.2 GB of device memory for a batch of two).
+  SD3 at 1024×1024 stays far below these sizes.

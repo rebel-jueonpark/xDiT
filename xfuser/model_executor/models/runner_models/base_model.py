@@ -25,7 +25,7 @@ from xfuser.envs import (
 )
 from xfuser.core import device_utils
 from xfuser.core.rbln_compile import compile_forward
-from xfuser.core.rbln_text_encoders import pin_module_to_device, place_t5_encoder_on_npu
+from xfuser.core.rbln_text_encoders import pin_module_to_device, pin_vae_decode_to_host, place_t5_encoder_on_npu
 from xfuser.core.utils.outputs_equal import outputs_equal
 from xfuser.core.utils.video_utils import encode_video
 from xfuser.logger import warn_once
@@ -377,6 +377,19 @@ class DiffusionOutput:
                 yield (video, single_pipe_args)
 
 
+def _idle_cores(threads: int) -> int:
+    """Thread count for host-side work on one rank: the cores idle at the time of the call, and
+    never fewer than the rank already has. On a shared host whose load exceeds its core count
+    an all-core OpenMP pool is several times slower than a small one (two CLIP encoders: 10 s
+    with 96 threads against 0.6 s with 8, at a load average of 180 on 96 cores)."""
+    cores = os.cpu_count() or threads
+    try:
+        busy = os.getloadavg()[0]
+    except OSError:
+        busy = 0.0
+    return max(threads, int(cores - busy))
+
+
 class xFuserModel(abc.ABC):
     """Base class for xFuser models"""
 
@@ -645,13 +658,19 @@ class xFuserModel(abc.ABC):
         module = getattr(pipe, "module", pipe)  # xFuser pipeline wrappers forward attributes
         if hasattr(module, "encode_prompt"):
             self._stage_timer.wrap(module, "encode_prompt", "encode")
-        transformer = getattr(module, "transformer", None)
-        if transformer is not None:
-            self._stage_timer.wrap(transformer, "forward", "denoise", count=True)
+        denoiser_name = self._denoiser_name()
+        denoiser = getattr(module, denoiser_name, None)
+        if denoiser is not None:
+            self._stage_timer.wrap(denoiser, "forward", "denoise", count=True)
         vae = getattr(module, "vae", None)
         if vae is not None and hasattr(vae, "decode"):
             self._stage_timer.wrap(vae, "decode", "decode")
-        log("Stage timers installed (encode_prompt / transformer.forward / vae.decode)")
+        log(f"Stage timers installed (encode_prompt / {denoiser_name}.forward / vae.decode)")
+
+    def _denoiser_name(self) -> str:
+        """The pipeline component the denoising loop calls: a DiT's transformer, or SDXL's UNet."""
+        pipe = getattr(self.pipe, "module", self.pipe)
+        return "transformer" if getattr(pipe, "transformer", None) is not None else "unet"
 
     def _local_onload_device(self) -> torch.device:
         """The device this rank offloads to and from, which is never implicitly cuda:0."""
@@ -1240,14 +1259,42 @@ class xFuserModel(abc.ABC):
         return backend
 
     def _get_rbln_compiled_pipe_components(self) -> List[str]:
-        """Components compiled on the rbln path: the transformer, which carries all of the
-        parallelism, plus the VAE decoder when it lives on the NPU. Text encoders are left
-        eager wherever they are; they run once per image and torch-rbln's eager mode or the
-        host handle them."""
-        names = ["transformer"]
-        if getattr(self.config, "rbln_vae_device", "rbln") == "rbln" and getattr(self.pipe, "vae", None) is not None:
+        """Components compiled on the rbln path: the denoiser (transformer or UNet), which
+        carries all of the parallelism, plus the VAE decoder when it lives on the NPU. Text
+        encoders are left eager wherever they are; they run once per image and torch-rbln's
+        eager mode or the host handle them."""
+        names = [self._denoiser_name()]
+        if self._rbln_vae_mode() == "rbln":
             names.append("vae")
         return names
+
+    def _rbln_vae_mode(self) -> str:
+        """Where the VAE decodes on RBLN: 'rbln' (decoder compiled by the rebel compiler through
+        torch.compile), 'cpu' (host), 'external' (a VAE compiled by optimum-rbln decodes the
+        latents, ``--rbln_vae_path``) or 'none'.
+
+        ``compile_vae_decode`` covers diffusers' ``AutoencoderKL``. Other VAEs (CogVideoX's
+        causal 3D VAE carries convolution caches from one chunk of frames to the next) fall
+        back to the host unless an external one is given.
+        """
+        from diffusers import AutoencoderKL
+
+        pipe = getattr(self.pipe, "module", self.pipe)
+        vae = getattr(pipe, "vae", None)
+        if vae is None:
+            return "none"
+        if getattr(self.config, "rbln_vae_path", None):
+            return "external"
+        mode = getattr(self.config, "rbln_vae_device", "rbln")
+        if mode == "rbln" and not isinstance(vae, AutoencoderKL):
+            if not getattr(self, "_rbln_vae_fallback_logged", False):
+                log(
+                    f"RBLN: no compiled decode path for {type(vae).__name__}; decoding on the host. "
+                    "Pass --rbln_vae_path to decode with a VAE compiled by optimum-rbln."
+                )
+                self._rbln_vae_fallback_logged = True
+            return "cpu"
+        return mode
 
     def _compile_model_rbln(self) -> None:
         """Compile the NPU-resident components through the rebel compiler.
@@ -1821,7 +1868,8 @@ class xFuserModel(abc.ABC):
         names = []
         if self._rbln_text_encoder_mode() in ("cpu", "spare"):
             names += [n for n in self.pipe.components if n.startswith("text_encoder")]
-        if getattr(self.config, "rbln_vae_device", "rbln") == "cpu" and "vae" in self.pipe.components:
+        # With an external VAE the pipeline's own one is never called; it leaves the NPU too.
+        if self._rbln_vae_mode() in ("cpu", "external") and "vae" in self.pipe.components:
             names.append("vae")
         return names
 
@@ -1851,6 +1899,10 @@ class xFuserModel(abc.ABC):
             )
         return index
 
+    def _rbln_text_seq_len(self) -> int:
+        """Token count the T5 blocks are compiled for: the length the pipeline pads prompts to."""
+        return getattr(self.config, "max_sequence_length", None) or 256
+
     def _place_text_encoders_on_spare_npu(self, names: List[str]) -> None:
         """This rank's text encoders on the spare NPU, compiled by the rebel compiler.
 
@@ -1866,7 +1918,7 @@ class xFuserModel(abc.ABC):
                 "which needs data_parallel_degree 1."
             )
         index = self._rbln_spare_device_index()
-        seq_len = getattr(self.config, "max_sequence_length", None) or 256
+        seq_len = self._rbln_text_seq_len()
         for name in names:
             component = self.pipe.components.get(name)
             if not isinstance(component, torch.nn.Module):
@@ -1900,6 +1952,8 @@ class xFuserModel(abc.ABC):
                 component = self.pipe.components.get(name)
                 if isinstance(component, torch.nn.Module):
                     pin_module_to_device(component, "cpu")
+                    if name == "vae":
+                        pin_vae_decode_to_host(component)
         if spare:
             self._place_text_encoders_on_spare_npu(spare)
             self._pin_rbln_pipeline_device(device_utils.local_device(get_world_group().local_rank))
@@ -1932,9 +1986,9 @@ class xFuserModel(abc.ABC):
 
         With the text encoders on the host, every rank of a replica would otherwise run
         T5-XXL on the same prompt at once, sharing the cores: four ranks took 15-19 s each
-        where one rank takes 1.3 s. Rank 0 encodes with every core (or on the spare NPU)
-        and the rest receive the tensors over the gloo group. Only for a single
-        data-parallel group, where all ranks hold the same prompts.
+        where one rank takes 1.3 s. Rank 0 encodes with the cores that were idle at setup
+        (or on the spare NPU) and the rest receive the tensors over the gloo group. Only for
+        a single data-parallel group, where all ranks hold the same prompts.
         """
         world = get_world_group()
         if world.world_size == 1 or self.config.data_parallel_degree != 1:
@@ -1945,6 +1999,12 @@ class xFuserModel(abc.ABC):
         original = pipe.encode_prompt
         cpu_group = world.cpu_group
         rank0 = world.ranks[0]
+        # More threads only help encoders that run on the host, and the count is decided here,
+        # once. Dynamo guards compiled code on the thread count: a count that followed the load
+        # average made the encoders compiled for the spare NPU recompile, and reload 9 GB of
+        # T5, whenever it changed between two prompts.
+        own_threads = torch.get_num_threads()
+        encode_threads = _idle_cores(own_threads) if self._rbln_text_encoder_mode() == "cpu" else own_threads
 
         def _to(obj, device):
             if isinstance(obj, torch.Tensor):
@@ -1958,12 +2018,11 @@ class xFuserModel(abc.ABC):
             device = kwargs.get("device") or getattr(pipe, "_execution_device", None)
             payload = [None]
             if world.rank == rank0:
-                threads = torch.get_num_threads()
-                torch.set_num_threads(os.cpu_count() or threads)
+                torch.set_num_threads(encode_threads)
                 try:
                     out = original(*args, **kwargs)
                 finally:
-                    torch.set_num_threads(threads)
+                    torch.set_num_threads(own_threads)
                 payload = [_to(out, "cpu")]
             torch.distributed.broadcast_object_list(payload, src=rank0, group=cpu_group)
             return _to(payload[0], device) if device is not None else payload[0]

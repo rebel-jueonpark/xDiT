@@ -30,6 +30,7 @@ Text-encoder TP is separate; see the **Text TP** column.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [CausalWan](#model-causalwan) | — | — | — | — | ✓ | — | ✓ | — | D+E |
 | [Chroma1-HD](#model-chroma1-hd) | ✓ | — | ✓ | — | ✓ | — | ✓ | — | — |
+| [CogVideoX-2b](#model-cogvideox-2b) | ✓ | ✓ | ✓ | — | ✓ | — | — | — | — |
 | [Cosmos3-Nano](#model-cosmos3-nano) | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | — | D+E |
 | [Cosmos3-Super](#model-cosmos3-super) | ✓ | ✓ | ✓ | — | ✓ | — | ✓ | — | D+E |
 | [FastH3](#model-fasth3) | ✓ | — | — | — | — | — | ✓ | ✓ | D |
@@ -69,6 +70,7 @@ Text-encoder TP is separate; see the **Text TP** column.
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D+E |
 | [SD3](#model-sd3) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D |
 | [SD3.5](#model-sd3-5) | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | D |
+| [SDXL](#model-sdxl) | — | — | ✓ | — | ✓ | — | — | — | — |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | ✓ | ✓ | — | — | ✓ | — | ✓ | — | — |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | ✓ | ✓ | — | — | ✓ | — | ✓ | — | — |
 | [VDN-H3](#model-vdn-h3) | ✓ | — | — | — | — | — | — | ✓ | D |
@@ -93,6 +95,7 @@ not the entire model. Text FP8 is a separate opt-in for supported encoders.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [CausalWan](#model-causalwan) | — | — | — | — | — | — | ✓ | ✓ |
 | [Chroma1-HD](#model-chroma1-hd) | — | — | — | — | — | — | — | — |
+| [CogVideoX-2b](#model-cogvideox-2b) | — | — | — | — | — | — | ✓ | ✓ |
 | [Cosmos3-Nano](#model-cosmos3-nano) | ✓ | ✓ | — | — | — | — | ✓ | ✓ |
 | [Cosmos3-Super](#model-cosmos3-super) | ✓ | ✓ | — | — | — | — | ✓ | ✓ |
 | [FastH3](#model-fasth3) | ✓ | ✓ | — | — | — | — | — | — |
@@ -132,6 +135,7 @@ not the entire model. Text FP8 is a separate opt-in for supported encoders.
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
 | [SD3](#model-sd3) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
 | [SD3.5](#model-sd3-5) | ✓ | — | — | — | — | ✓ | ✓ | ✓ |
+| [SDXL](#model-sdxl) | — | — | — | — | — | — | ✓ | ✓ |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | — | — | — | — | — | — | ✓ | ✓ |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | — | — | — | — | — | — | ✓ | ✓ |
 | [VDN-H3](#model-vdn-h3) | ✓ | — | — | — | — | — | — | — |
@@ -159,6 +163,7 @@ requires a compatible DBCache layout and is described in the PipeFusion guide.
 | --- | --- | --- | --- | --- | --- |
 | [CausalWan](#model-causalwan) | — | — | — | `dbcache` | — |
 | [Chroma1-HD](#model-chroma1-hd) | — | — | — | — | — |
+| [CogVideoX-2b](#model-cogvideox-2b) | — | — | — | — | — |
 | [Cosmos3-Nano](#model-cosmos3-nano) | — | — | — | — | — |
 | [Cosmos3-Super](#model-cosmos3-super) | — | — | — | — | — |
 | [FastH3](#model-fasth3) | — | — | ✓ | — | — |
@@ -198,6 +203,7 @@ requires a compatible DBCache layout and is described in the PipeFusion guide.
 | [Qwen-Image-Edit](#model-qwen-image-edit) | ✓ | — | — | `dbcache` | — |
 | [SD3](#model-sd3) | ✓ | — | — | `dbcache` | — |
 | [SD3.5](#model-sd3-5) | ✓ | — | — | `dbcache` | — |
+| [SDXL](#model-sdxl) | — | — | — | — | — |
 | [SkyReels-V2-I2V-14B](#model-skyreels-v2-i2v-14b) | — | — | — | — | — |
 | [SkyReels-V2-T2V-14B](#model-skyreels-v2-t2v-14b) | — | — | — | — | — |
 | [VDN-H3](#model-vdn-h3) | — | — | — | — | — |
@@ -227,6 +233,7 @@ Optional and task-specific inputs are labeled; check the source for image counts
 | --- | --- | --- | --- | --- |
 | <a id="model-causalwan"></a>[CausalWan](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/causal_wan.py) | `CausalWan` | Text; i2v requires one image | video | `0.35.2` |
 | <a id="model-chroma1-hd"></a>[Chroma1-HD](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/chroma.py) | `Chroma1-HD`, `lodestones/Chroma1-HD` | Text | image | `0.35.0` |
+| <a id="model-cogvideox-2b"></a>[CogVideoX-2b](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/cogvideox.py) | `CogVideoX-2b`, `THUDM/CogVideoX-2b`, `zai-org/CogVideoX-2b` | Text | video | Not declared |
 | <a id="model-cosmos3-nano"></a>[Cosmos3-Nano](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/cosmos3.py) | `Cosmos3-Nano`, `nvidia/Cosmos3-Nano` | Text; optional image | video | `0.39.0` |
 | <a id="model-cosmos3-super"></a>[Cosmos3-Super](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/cosmos3.py) | `Cosmos3-Super`, `nvidia/Cosmos3-Super` | Text; optional image | video | `0.39.0` |
 | <a id="model-fasth3"></a>[FastH3](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/minimax_h3.py) | `FastH3`, `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`, `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-Synthetic-Step1300`, `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-Synthetic-Step1900` | Text (t2va) | video + audio | `0.40.0` |
@@ -266,6 +273,7 @@ Optional and task-specific inputs are labeled; check the source for image counts
 | <a id="model-qwen-image-edit"></a>[Qwen-Image-Edit](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/qwen.py) | `Qwen-Image-Edit`, `Qwen-Image-Edit-2509`, `Qwen-Image-Edit-2511`, `Qwen/Qwen-Image-Edit`, `Qwen/Qwen-Image-Edit-2509`, `Qwen/Qwen-Image-Edit-2511` | Text + one image; 2509/2511 require one or more images | image | `0.37.0` |
 | <a id="model-sd3"></a>[SD3](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/stable_diffusion.py) | `SD3`, `SD3-medium`, `stable-diffusion-3-medium`, `stabilityai/stable-diffusion-3-medium-diffusers` | Text | image | Not declared |
 | <a id="model-sd3-5"></a>[SD3.5](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/stable_diffusion.py) | `SD3.5`, `stable-diffusion-3.5-large`, `stabilityai/stable-diffusion-3.5-large` | Text | image | Not declared |
+| <a id="model-sdxl"></a>[SDXL](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/sdxl.py) | `SDXL`, `stable-diffusion-xl-base-1.0`, `stabilityai/stable-diffusion-xl-base-1.0` | Text | image | Not declared |
 | <a id="model-skyreels-v2-i2v-14b"></a>[SkyReels-V2-I2V-14B](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/skyreels_v2.py) | `SkyReels-V2-I2V-14B`, `SkyReels-V2-I2V-1.3B`, `Skywork/SkyReels-V2-I2V-14B-540P-Diffusers`, `Skywork/SkyReels-V2-I2V-1.3B-540P-Diffusers` | Text + one image | video | `0.36.0` |
 | <a id="model-skyreels-v2-t2v-14b"></a>[SkyReels-V2-T2V-14B](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/skyreels_v2.py) | `SkyReels-V2-T2V-14B`, `Skywork/SkyReels-V2-T2V-14B-540P-Diffusers` | Text | video | `0.36.0` |
 | <a id="model-vdn-h3"></a>[VDN-H3](https://github.com/xdit-project/xDiT/blob/main/xfuser/model_executor/models/runner_models/minimax_h3.py) | `VDN-H3`, `OpenVDN/vdn-minimax-h3` | Text (t2va) | video + audio | `0.40.0` |

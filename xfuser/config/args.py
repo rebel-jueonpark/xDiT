@@ -248,6 +248,8 @@ class xFuserArgs:
     rbln_text_encoder_device: str = "cpu"  # cpu | rbln | spare (one NPU beyond the ranks', rank 0 encodes)
     rbln_spare_device: Optional[int] = None  # NPU index for 'spare'; default: the local world size
     rbln_vae_device: str = "rbln"
+    rbln_vae_path: Optional[str] = None  # a VAE compiled by optimum-rbln, for VAEs xDiT cannot compile itself
+    rbln_vae_npu: Optional[int] = None  # NPU index for that VAE; default: the first one beyond the ranks' own
     # Parallel arguments
     # data parallel
     data_parallel_degree: int = 1
@@ -738,6 +740,23 @@ class xFuserArgs:
             help="RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host.",
         )
         runtime_group.add_argument(
+            "--rbln_vae_path",
+            type=str,
+            default=None,
+            help="RBLN only: directory of a VAE compiled by optimum-rbln (the pipeline directory or its vae/ "
+            "subfolder). The last rank decodes the final latents with it. For VAEs whose decode path xDiT "
+            "does not compile itself (CogVideoX's causal 3D VAE).",
+        )
+        runtime_group.add_argument(
+            "--rbln_vae_npu",
+            type=int,
+            default=None,
+            help="RBLN only: index (within RBLN_DEVICES) of the NPU the --rbln_vae_path VAE runs on. Default: the "
+            "first NPU beyond the ranks' own, or the second when the text encoders take that one "
+            "(--rbln_text_encoder_device spare). CogVideoX's VAE needs about 12 GB at 49 frames of 480x720 and "
+            "does not fit beside the transformer.",
+        )
+        runtime_group.add_argument(
             "--use_onediff",
             action="store_true",
             help="Enable onediff to accelerate inference in a single card",
@@ -1143,6 +1162,18 @@ class xFuserArgs:
             default="rbln",
             choices=["cpu", "rbln"],
             help="RBLN only: 'rbln' compiles the VAE decoder for the NPU, 'cpu' decodes on the host.",
+        )
+        parser.add_argument(
+            "--rbln_vae_path",
+            type=str,
+            default=None,
+            help="RBLN only: directory of a VAE compiled by optimum-rbln to decode the final latents with.",
+        )
+        parser.add_argument(
+            "--rbln_vae_npu",
+            type=int,
+            default=None,
+            help="RBLN only: index (within RBLN_DEVICES) of the NPU the --rbln_vae_path VAE runs on.",
         )
         parser.add_argument(
             "--attention_backend",

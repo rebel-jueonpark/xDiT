@@ -79,6 +79,26 @@ def pin_module_to_device(module: nn.Module, device) -> None:
     module._xfuser_pinned_device = device
 
 
+def pin_vae_decode_to_host(vae: nn.Module) -> None:
+    """Decode on the host, in float32, and leave the frames there.
+
+    A pipeline calls ``vae.decode`` (not ``forward``) with latents on the NPU. The decoded
+    pixels only feed the host-side post-processing, so nothing goes back to the device;
+    float32 because bfloat16 convolutions are slow on a CPU.
+    """
+    if getattr(vae, "_xfuser_host_decode", False):
+        return
+    vae.to("cpu", torch.float32)
+    original_decode = vae.decode
+
+    @functools.wraps(original_decode)
+    def decode(z, *args, **kwargs):
+        return original_decode(z.to("cpu", torch.float32), *args, **kwargs)
+
+    vae.decode = decode
+    vae._xfuser_host_decode = True
+
+
 class T5EncoderBlocks(nn.Module):
     """A T5 encoder stack minus its embedding lookup, for a fixed sequence length.
 

@@ -378,6 +378,16 @@ class UnetRuntimeState(RuntimeState):
             if not (self.parallel_config.cfg_degree == 2 and self.parallel_config.world_size == 2):
                 raise RuntimeError("UnetRuntimeState only supports 2 GPUs with CFG Parallel")
 
+    # The runner asks every runtime state about per-step schedules; a UNet has none.
+    def has_attention_schedule(self) -> bool:
+        return False
+
+    def has_gemm_schedule(self) -> bool:
+        return False
+
+    def reset_step_counter(self) -> None:
+        pass
+
 
 class DiTRuntimeState(RuntimeState):
     patch_mode: bool
